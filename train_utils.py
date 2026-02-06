@@ -1,10 +1,8 @@
 
-# best_val_loss = float("inf")  # best validation loss to compare against
-# no_improvement_count = 0  # count of epochs with no improvement
 
 
 class EarlyStopping:
-    def __init__(self, patience=5, delta=0.01, verbose=False):
+    def __init__(self, patience=10, delta=0.005, verbose=False):
         self.patience = patience
         self.delta = delta
         self.verbose = verbose

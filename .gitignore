@@ -1,8 +1,11 @@
+# ignore folders
 data/
+models/
 old/
 .venv/
 __pycache__/
 
 .DS_Store
 
+# Ignore links
 data
