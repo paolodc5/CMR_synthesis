@@ -1,4 +1,6 @@
+import torch
 from torch import nn
+from torchinfo import summary
 
 # Generator block is a unet advanced modified with dropout
 
@@ -42,8 +44,10 @@ class ConvNormAct(nn.Module):
         return out
     
 class DiscriminatorModel(nn.Module):
-    def __init__(self, in_ch=4, base_ch=64):
+    def __init__(self, in_ch=4, base_ch=64, use_fc=True):
         super().__init__()
+        self.use_fc = use_fc
+
         self.conv1 = ConvNormAct(in_ch, base_ch, kernel_size=3, stride=2, padding=1, norm=False, act=nn.GELU)
         self.conv2 = ConvNormAct(base_ch, base_ch*2, kernel_size=3, stride=2, padding=1, norm=nn.BatchNorm2d, act=nn.GELU)
         self.conv3 = ConvNormAct(base_ch*2, base_ch*4, kernel_size=3, stride=2, padding=1, norm=nn.BatchNorm2d, act=nn.GELU)
@@ -51,6 +55,7 @@ class DiscriminatorModel(nn.Module):
 
         self.ap = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.Linear(base_ch*8, 1)
+        self.final_conv = nn.Conv2d(base_ch*8, 1, kernel_size=3, stride=1, padding=1)
 
     def forward(self, x):
         x = self.conv1(x)
@@ -58,10 +63,19 @@ class DiscriminatorModel(nn.Module):
         x = self.conv3(x)
         x = self.conv4(x)
 
-        x = self.ap(x)
-        x = x.view(x.shape[0], -1)
-        out = self.fc(x)
+        if self.use_fc:
+            print("Sono qui")
+            x = self.ap(x)
+            x = x.view(x.shape[0], -1)
+            out = self.fc(x)
+        else:
+            out = self.final_conv(x)
 
         return out
 
+
+
+if __name__ == "__main__":
+    discr = DiscriminatorModel(in_ch=4, base_ch=64, use_fc=False)
+    summary(discr, input_size=(2, 4, 256, 256))
 

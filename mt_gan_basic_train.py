@@ -1,12 +1,12 @@
 import os
+import sys
 import numpy as np
-import matplotlib.pyplot as plt
 from tqdm import tqdm
 from itertools import cycle
 from datetime import datetime
 import json
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 
 import torch
 from torch.utils.data import DataLoader
@@ -16,30 +16,33 @@ from torch import device, nn, optim
 from utils import (load_all_data, 
                    squeeze_and_concat, 
                    filter_mask_keep_labels, 
-                   multiclass_dice_loss)
+                   multiclass_dice_loss,
+                   set_reproducibility)
 from datasets import MultiTissueDataset
 from unet_advanced import UNetAdvanced as UNetGan
 from gan_basic import DiscriminatorModel
 from train_utils import EarlyStopping, save_checkpoint
 
-DATA_FOLDER = "/scratch/pdiciano/GenAI/ACDC_mine/data/ACDC_tissue_prop"
 
+DATA_FOLDER = "/scratch/pdiciano/GenAI/ACDC_mine/data/ACDC_tissue_prop"
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-RUN_NAME = "MT_basic_gan"
+set_reproducibility(187)
+
+RUN_NAME = "MT_basic_gan_longer"
 TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M")
 EXP_DIR = f"./experiments/{TIMESTAMP}_{RUN_NAME}"
 
 VAL_FRACTION = 0.2
 
 # Hyperparameters (not best practice to define here)
-NUM_STEPS = 121
+NUM_STEPS = 7500
 N_DISCR_STEPS = 1
 VAL_CHECK_INTERVAL = 120
 LAMBDA_CE = 10.0
 DROPOUT_GEN = 0.3
-PATIENCE_ES = 10 # num * VAL_CHECK_INTERVAL steps with no improvement
-
+PATIENCE_ES = 5 # num * VAL_CHECK_INTERVAL steps with no improvement
+BATCH_SIZE = 16
 
 def train_discriminator(batch, gen, discr, criterion_GAN, optim_discr, device='cpu'):
     input = batch['input_label'].to(device) # Models passed to the function should be already on the same device
@@ -123,7 +126,7 @@ def validate_generator(val_dataloader, gen, discr, criterion_GAN, criterion_CE, 
     return avg_gan_loss, avg_ce_loss, avg_dice_loss
 
 def train_gan(num_steps, n_discr_steps, val_check_interval, gen, discr, dataloader, val_dataloader, criterion_GAN, criterion_CE, optim_gen, optim_discr, lambda_ce, es, device, exp_dir):
-    pbar = tqdm(range(num_steps), desc="Training step")
+    pbar = tqdm(range(num_steps), desc="Training step", file=sys.__stderr__)
     
     metrics_history = {
         'train_D_loss': [],
@@ -162,18 +165,21 @@ def train_gan(num_steps, n_discr_steps, val_check_interval, gen, discr, dataload
             metrics_history['val_CE_loss'].append(val_ce_loss)
             metrics_history['val_Dice_loss'].append(val_dice_loss)
 
+            print(f"VAL: Step {step}: Val GAN Loss: {val_gan_loss:.4f}, Val CE Loss: {val_ce_loss:.4f}, Val Dice Loss: {val_dice_loss:.4f}")
+
             # Save checkpoint
             save_checkpoint(exp_dir, step, gen, discr, optim_gen, optim_discr, metrics_history)
 
             # check for early stopping based on validation dice score
-            es.check_early_stop(1-val_dice_loss)
+            es.check_early_stop(val_dice_loss)
             if es.no_improvement_count == 0 and step > 0: # Save best model based on validation dice score
                 torch.save(gen.state_dict(), f"{exp_dir}/best_generator.pth")
             if es.stop_training:
-                print(f"Early stopping triggered at step {step}. Best validation Dice score: {es.best_score:.4f}")
+                print(f"Early stopping triggered at step {step}")
                 break
         
         if step % 20 == 0: # Update progress bar every 20 steps
+            print(f"Step {step}: Train D Loss: {loss_discr:.4f}, Train G Loss: {loss_gen:.4f}, Train CE Loss: {ce_loss:.4f}")
             pbar.set_postfix({
                 'train_D_loss': f'{loss_discr:.4f}', 
                 'train_G_loss': f'{loss_gen:.4f}',
@@ -191,6 +197,11 @@ def train_gan(num_steps, n_discr_steps, val_check_interval, gen, discr, dataload
 
 def main():
     os.makedirs(EXP_DIR, exist_ok=True)
+
+    log_file = open(f"{EXP_DIR}/log.txt", "w")
+    sys.stdout = log_file
+    sys.stderr = log_file
+    print('Experiment directory:', EXP_DIR)
 
     # checks on devices
     p = torch.cuda.get_device_properties(DEVICE)
@@ -220,13 +231,18 @@ def main():
     train_dataset = MultiTissueDataset(train_data)
     val_dataset = MultiTissueDataset(val_data)
 
-    train_dataloader = DataLoader(train_dataset, batch_size=8, shuffle=True)
-    val_dataloader = DataLoader(val_dataset, batch_size=8, shuffle=False)
+    train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    val_dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
 
     # Training objects instantiation
     gen = UNetGan(in_ch=4, num_classes=12, dropout_p=DROPOUT_GEN).to(DEVICE)
     discr = DiscriminatorModel(in_ch=16, base_ch=64).to(DEVICE)
+
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs for training.")
+        gen = nn.DataParallel(gen)
+        discr = nn.DataParallel(discr)
 
     criterion_GAN = nn.BCEWithLogitsLoss()
     criterion_CE = nn.CrossEntropyLoss() # CE loss for segmentation (better than L1 for classification tasks)
@@ -245,6 +261,7 @@ def main():
         'batch_size': train_dataloader.batch_size,
         'learning_rate_gen': optim_gen.param_groups[0]['lr'],
         'learning_rate_discr': optim_discr.param_groups[0]['lr'],
+        'batch_size': BATCH_SIZE,
         'notes': "basic GAN training with UNet generator and simple discriminator"
     }
 
@@ -267,6 +284,8 @@ def main():
                         es, 
                         DEVICE,
                         EXP_DIR)
+    
+    log_file.close()
 
 if __name__ == "__main__":
     main()

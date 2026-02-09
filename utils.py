@@ -1,6 +1,9 @@
 import os
 import numpy as np
 import torch.nn.functional as F
+import torch
+import random
+import numpy as np
 
 
 def load_all_data(folder_path):
@@ -91,7 +94,6 @@ def filter_mask_keep_labels(mask, keep_labels=(0, 1, 3), background_label=4):
         out = out.astype(mask_np.dtype, copy=False)
     return out
 
-
 def multiclass_dice_loss(pred, target, smooth=1):
     """
     Computes Dice Loss for multi-class segmentation.
@@ -150,3 +152,13 @@ def check_gradients(model, model_name):
         print(f"✅ ALIVE: The signal is flowing (Total Mean Norm: {total_norm:.6f})")
     print("-" * 40)
 
+def set_reproducibility(seed=42):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    
+    np.random.seed(seed)
+    
+    torch.manual_seed(seed)
+    
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
