@@ -117,3 +117,36 @@ def multiclass_dice_loss(pred, target, smooth=1):
 
     return 1 - dice.mean() / num_classes  # Average Dice Loss across classes
 
+def check_gradients(model, model_name):
+    """
+    Checks the gradients of a PyTorch model after backward() to identify potential issues.
+    Prints a summary of the gradient status for each parameter and an overall assessment.
+    """
+    print(f"--- Check gradients: {model_name} ---")
+    total_norm = 0.0
+    has_grads = False
+    
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            has_grads = True
+            # Calculate the mean absolute gradient for this layer
+            grad_mean = param.grad.abs().mean().item()
+            grad_max = param.grad.abs().max().item()
+            
+            # Print only if the gradient is suspiciously zero or very high
+            if grad_mean == 0.0:
+                print(f"⚠️ {name}: ZERO GRADIENT (Dead)")
+            else:
+                # Accumulate to see if there's life in general
+                total_norm += grad_mean
+        else:
+            print(f"❌ {name}: NO GRADIENT (Graph broken or frozen)")
+
+    if not has_grads:
+        print(f"💀 DEAD: No gradients found in {model_name}!")
+    elif total_norm == 0.0:
+        print(f"❄️ DEEP COMA: Gradients exist but are all zero (Argmax/Saturation).")
+    else:
+        print(f"✅ ALIVE: The signal is flowing (Total Mean Norm: {total_norm:.6f})")
+    print("-" * 40)
+
