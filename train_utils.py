@@ -1,4 +1,5 @@
-
+import torch
+import os
 
 
 class EarlyStopping:
@@ -20,3 +21,22 @@ class EarlyStopping:
                 self.stop_training = True
                 if self.verbose:
                     print("Stopping early as no improvement has been observed.")
+
+
+def save_checkpoint(exp_dir, epoch, generator, discriminator, opt_g, opt_d, history):
+    """
+    Saves the complete training state to be able to resume it.
+    Always overwrites the same file 'last_checkpoint.pth' to save space.
+    """
+    checkpoint_path = os.path.join(exp_dir, "last_checkpoint.pth")
+    
+    state = {
+        'epoch': epoch,
+        'gen_state_dict': generator.state_dict(),
+        'disc_state_dict': discriminator.state_dict(),
+        'opt_g_state_dict': opt_g.state_dict(),
+        'opt_d_state_dict': opt_d.state_dict(),
+        'history': history
+    }
+    
+    torch.save(state, checkpoint_path)
