@@ -6,7 +6,7 @@ from itertools import cycle
 from datetime import datetime
 import json
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2,3"
 
 import torch
 from torch.utils.data import DataLoader
@@ -27,22 +27,30 @@ from train_utils import EarlyStopping, save_checkpoint
 DATA_FOLDER = "/scratch/pdiciano/GenAI/ACDC_mine/data/ACDC_tissue_prop"
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-set_reproducibility(187)
+SEED = 187
+set_reproducibility(SEED)
 
-RUN_NAME = "MT_basic_gan_longer"
+RUN_NAME = "MT_basic_gan"
 TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M")
 EXP_DIR = f"./experiments/{TIMESTAMP}_{RUN_NAME}"
 
 VAL_FRACTION = 0.2
 
-# Hyperparameters (not best practice to define here)
+# Hyperparameters (not best practice to be defined here)
 NUM_STEPS = 7500
 N_DISCR_STEPS = 1
+N_GEN_STEPS = 1
 VAL_CHECK_INTERVAL = 120
 LAMBDA_CE = 10.0
 DROPOUT_GEN = 0.3
+GEN_LR = 1e-4
+DISCR_LR = 1e-5
 PATIENCE_ES = 5 # num * VAL_CHECK_INTERVAL steps with no improvement
+DELTA_ES = 0.01 # minimum improvement in validation dice loss to reset early stopping counter
 BATCH_SIZE = 16
+NOTES="Discr learning rate 10 times lower than the generator one."
+PARALLEL = True
+
 
 def train_discriminator(batch, gen, discr, criterion_GAN, optim_discr, device='cpu'):
     input = batch['input_label'].to(device) # Models passed to the function should be already on the same device
@@ -125,7 +133,7 @@ def validate_generator(val_dataloader, gen, discr, criterion_GAN, criterion_CE, 
 
     return avg_gan_loss, avg_ce_loss, avg_dice_loss
 
-def train_gan(num_steps, n_discr_steps, val_check_interval, gen, discr, dataloader, val_dataloader, criterion_GAN, criterion_CE, optim_gen, optim_discr, lambda_ce, es, device, exp_dir):
+def train_gan(num_steps, n_discr_steps, n_gen_steps, val_check_interval, gen, discr, dataloader, val_dataloader, criterion_GAN, criterion_CE, optim_gen, optim_discr, lambda_ce, es, device, exp_dir):
     pbar = tqdm(range(num_steps), desc="Training step", file=sys.__stderr__)
     
     metrics_history = {
@@ -151,8 +159,15 @@ def train_gan(num_steps, n_discr_steps, val_check_interval, gen, discr, dataload
             running_loss_discr = train_discriminator(batch, gen, discr, criterion_GAN, optim_discr, device)
             loss_discr += running_loss_discr
         loss_discr /= n_discr_steps
-    
-        loss_gen, ce_loss = train_generator(batch, gen, discr, criterion_GAN, criterion_CE, optim_gen, lambda_ce, device)
+
+        loss_gen = 0.0
+        ce_loss = 0.0
+        for _ in range(n_gen_steps): # Nested loop to allow multiple generator updates per discriminator update
+            running_loss_gen, running_ce_loss = train_generator(batch, gen, discr, criterion_GAN, criterion_CE, optim_gen, lambda_ce, device)
+            loss_gen += running_loss_gen
+            ce_loss += running_ce_loss
+        loss_gen /= n_gen_steps
+        ce_loss /= n_gen_steps
 
         metrics_history['train_D_loss'].append(loss_discr)
         metrics_history['train_G_loss'].append(loss_gen)
@@ -225,6 +240,14 @@ def main():
     train_indices = indices[:int(num_samples*(1-VAL_FRACTION))]
     val_indices = indices[int(num_samples*(1-VAL_FRACTION)):]
 
+    ### Save train-val split indices for reproducibility
+    split_info = {
+        'train_indices': train_indices.tolist(),
+        'val_indices': val_indices.tolist()
+    }
+    with open(f"{EXP_DIR}/train_val_split.json", "w") as f:
+        json.dump(split_info, f, indent=4)
+
     train_data = {key: value[train_indices] for key, value in data_concat.items()}
     val_data = {key: value[val_indices] for key, value in data_concat.items()}
 
@@ -239,7 +262,7 @@ def main():
     gen = UNetGan(in_ch=4, num_classes=12, dropout_p=DROPOUT_GEN).to(DEVICE)
     discr = DiscriminatorModel(in_ch=16, base_ch=64).to(DEVICE)
 
-    if torch.cuda.device_count() > 1:
+    if torch.cuda.device_count() > 1 and PARALLEL:
         print(f"Using {torch.cuda.device_count()} GPUs for training.")
         gen = nn.DataParallel(gen)
         discr = nn.DataParallel(discr)
@@ -247,10 +270,10 @@ def main():
     criterion_GAN = nn.BCEWithLogitsLoss()
     criterion_CE = nn.CrossEntropyLoss() # CE loss for segmentation (better than L1 for classification tasks)
 
-    optim_gen = optim.Adam(gen.parameters(), lr=1e-4)
-    optim_discr = optim.Adam(discr.parameters(), lr=1e-4)
+    optim_gen = optim.Adam(gen.parameters(), lr=GEN_LR)
+    optim_discr = optim.Adam(discr.parameters(), lr=DISCR_LR)
 
-    es = EarlyStopping(patience=PATIENCE_ES, delta=0.01)  
+    es = EarlyStopping(patience=PATIENCE_ES, delta=DELTA_ES)  
 
     # save config
     config = {
@@ -262,7 +285,13 @@ def main():
         'learning_rate_gen': optim_gen.param_groups[0]['lr'],
         'learning_rate_discr': optim_discr.param_groups[0]['lr'],
         'batch_size': BATCH_SIZE,
-        'notes': "basic GAN training with UNet generator and simple discriminator"
+        'notes': NOTES,
+        'patience_es': PATIENCE_ES,
+        'delta_es': DELTA_ES,
+        'dropout_gen': DROPOUT_GEN,
+        'num_gpus': torch.cuda.device_count() if PARALLEL else 1,
+        'validation_fraction': VAL_FRACTION,
+        'seed': SEED,
     }
 
     with open(f"{EXP_DIR}/config.json", "w") as f:
@@ -270,7 +299,8 @@ def main():
     
     # training loop
     history = train_gan(NUM_STEPS, 
-                        N_DISCR_STEPS, 
+                        N_DISCR_STEPS,
+                        N_GEN_STEPS, 
                         VAL_CHECK_INTERVAL, 
                         gen, 
                         discr, 
