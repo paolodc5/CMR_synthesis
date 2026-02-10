@@ -64,7 +64,6 @@ class DiscriminatorModel(nn.Module):
         x = self.conv4(x)
 
         if self.use_fc:
-            print("Sono qui")
             x = self.ap(x)
             x = x.view(x.shape[0], -1)
             out = self.fc(x)

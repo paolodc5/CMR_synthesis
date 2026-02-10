@@ -6,7 +6,7 @@ from itertools import cycle
 from datetime import datetime
 import json
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "2,3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 
 import torch
 from torch.utils.data import DataLoader
@@ -30,7 +30,7 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 SEED = 187
 set_reproducibility(SEED)
 
-RUN_NAME = "MT_basic_gan"
+RUN_NAME = "MT_basic_gan_0"
 TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M")
 EXP_DIR = f"./experiments/{TIMESTAMP}_{RUN_NAME}"
 
@@ -41,14 +41,14 @@ NUM_STEPS = 7500
 N_DISCR_STEPS = 1
 N_GEN_STEPS = 1
 VAL_CHECK_INTERVAL = 120
-LAMBDA_CE = 10.0
+LAMBDA_CE = 1
 DROPOUT_GEN = 0.3
 GEN_LR = 1e-4
-DISCR_LR = 1e-5
+DISCR_LR = 1e-4
 PATIENCE_ES = 5 # num * VAL_CHECK_INTERVAL steps with no improvement
 DELTA_ES = 0.01 # minimum improvement in validation dice loss to reset early stopping counter
 BATCH_SIZE = 16
-NOTES="Discr learning rate 10 times lower than the generator one."
+NOTES="Basic GAN same lr for discr and gen, same weight to the 2 losses (CE and GAN loss)"
 PARALLEL = True
 
 
