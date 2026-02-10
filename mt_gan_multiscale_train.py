@@ -31,27 +31,27 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 SEED = 187
 set_reproducibility(SEED)
 
-RUN_NAME = "MT_multiscale_perceptual_loss_test" # to be used in the experiment directory name, e.g., "20240601_1230_MT_multiscale_perceptual_loss_test"
+RUN_NAME = "MT_multiscale_perc_loss" # to be used in the experiment directory name, e.g., "20240601_1230_MT_multiscale_perceptual_loss_test"
 TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M")
 EXP_DIR = f"./experiments/{TIMESTAMP}_{RUN_NAME}"
 
 VAL_FRACTION = 0.2
 
 # Hyperparameters (not best practice to be defined here)
-NUM_STEPS = 10
+NUM_STEPS = 7500
 N_DISCR_STEPS = 1
 N_GEN_STEPS = 1
 VAL_CHECK_INTERVAL = 120
 LAMBDA_CE = 10.0
-LAMBDA_PERC = 1.0
+LAMBDA_PERC = 5.0
 DROPOUT_GEN = 0.3
 GEN_LR = 1e-4
 DISCR_LR = 1e-5
 NUM_DISCRIMINATORS = 4
-PATIENCE_ES = 5 # num * VAL_CHECK_INTERVAL steps with no improvement
+PATIENCE_ES = 15 # num * VAL_CHECK_INTERVAL steps with no improvement
 DELTA_ES = 0.01 # minimum improvement in validation dice loss to reset early stopping counter
 BATCH_SIZE = 16
-NOTES="4 discriminators run in parallel over different dimensionalities of the input. Discr learning rate 10 times lower than the generator one."
+NOTES="changed patience wrt previous experiments with perc loss"
 PARALLEL = True
 
 
@@ -106,13 +106,14 @@ def train_generator(batch, gen, discr, criterion_GAN, criterion_CE, criterion_pe
 
     return loss_gen.item(), ce_loss.item(), perc_loss.item()
 
-def validate_generator(val_dataloader, gen, discr, criterion_GAN, criterion_CE, lambda_ce, device='cpu'):
+def validate_generator(val_dataloader, gen, discr, criterion_GAN, criterion_CE, criterion_perc, lambda_ce, lambda_perc, device='cpu'):
     gen.eval()
     discr.eval()
 
     total_gan_loss = 0.0
     total_ce_loss = 0.0
     total_dice_loss = 0.0
+    total_perc_loss = 0.0
     num_batches = 0
 
     with torch.no_grad():
@@ -126,21 +127,27 @@ def validate_generator(val_dataloader, gen, discr, criterion_GAN, criterion_CE, 
             discr_input_fake = torch.cat([input, gen_img_probs], dim=1)
             discr_fake = discr(discr_input_fake)
 
+            gt_onehot = torch.zeros_like(gen_img_probs).scatter_(1, gt.unsqueeze(1), 1.0) # Assigns 1.0 in the corresponding class channel based on gt indices (0-11)
+            discr_input_real = torch.cat([input, gt_onehot], dim=1)  # Real pairs: input + gt
+            discr_real = discr(discr_input_real)
+
             # Compute losses
             ce_loss = criterion_CE(gen_img, gt)
             gan_loss = compute_multiscale_loss(discr_fake, target=1, criterion=criterion_GAN)
             dice_loss = multiclass_dice_loss(gen_img, gt) # Logits here as input
-
+            perc_loss = compute_perceptual_loss(discr_real, discr_fake, criterion_perc)
             total_gan_loss += gan_loss.item()
             total_ce_loss += ce_loss.item()
             total_dice_loss += dice_loss.item()
+            total_perc_loss += perc_loss.item()
             num_batches += 1
 
     avg_gan_loss = total_gan_loss / num_batches
     avg_ce_loss = total_ce_loss / num_batches
     avg_dice_loss = total_dice_loss / num_batches
+    avg_perc_loss = total_perc_loss / num_batches
 
-    return avg_gan_loss, avg_ce_loss, avg_dice_loss
+    return avg_gan_loss, avg_ce_loss, avg_dice_loss, avg_perc_loss
 
 def train_gan(num_steps, n_discr_steps, n_gen_steps, val_check_interval, gen, discr, dataloader, val_dataloader, criterion_GAN, criterion_CE, criterion_perc, optim_gen, optim_discr, lambda_ce, lambda_perc, es, device, exp_dir):
     pbar = tqdm(range(num_steps), desc="Training step", file=sys.__stderr__)
@@ -153,6 +160,7 @@ def train_gan(num_steps, n_discr_steps, n_gen_steps, val_check_interval, gen, di
         'val_G_loss': [],
         'val_CE_loss': [],
         'val_Dice_loss': [],
+        'val_Perc_loss': [],
         'current_step': 0.0
     }
 
@@ -189,12 +197,13 @@ def train_gan(num_steps, n_discr_steps, n_gen_steps, val_check_interval, gen, di
         metrics_history['current_step'] = step
 
         if step % val_check_interval == 0 and step > 0: # Validate every val_check_interval steps
-            val_gan_loss, val_ce_loss, val_dice_loss = validate_generator(val_dataloader, gen, discr, criterion_GAN, criterion_CE, lambda_ce, device)
+            val_gan_loss, val_ce_loss, val_dice_loss, val_perc_loss = validate_generator(val_dataloader, gen, discr, criterion_GAN, criterion_CE, criterion_perc, lambda_ce, lambda_perc, device)
             metrics_history['val_G_loss'].append(val_gan_loss)
             metrics_history['val_CE_loss'].append(val_ce_loss)
             metrics_history['val_Dice_loss'].append(val_dice_loss)
+            metrics_history['val_Perc_loss'].append(val_perc_loss)
 
-            print(f"VAL: Step {step}: Val GAN Loss: {val_gan_loss:.4f}, Val CE Loss: {val_ce_loss:.4f}, Val Dice Loss: {val_dice_loss:.4f}")
+            print(f"VAL: Step {step}: Val GAN Loss: {val_gan_loss:.4f}, Val CE Loss: {val_ce_loss:.4f}, Val Dice Loss: {val_dice_loss:.4f}, Val Perc Loss: {val_perc_loss:.4f}")
 
             # Save checkpoint
             save_checkpoint(exp_dir, step, gen, discr, optim_gen, optim_discr, metrics_history)

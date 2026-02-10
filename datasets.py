@@ -36,16 +36,17 @@ class MultiTissueDataset(Dataset):
 
 
 class MultiTissueDatasetNoisyBkg(MultiTissueDataset):
-    def __init__(self, data_concat):
+    def __init__(self, data_concat, variance=1, mean=0.5):
         super().__init__(data_concat)
         self.background_label = 3
-
+        self.variance = variance
+        self.mean = mean
     def __getitem__(self, idx):
         sample = super().__getitem__(idx)
         input_label = sample['input_label']
         
         bkg_mask = input_label[self.background_label]  # Get the background mask
-        noise = torch.randn_like(input_label)  # Generate noise of the same shape
+        noise = torch.randn_like(input_label) * np.sqrt(self.variance)  + self.mean # Generate noise of the same shape
         
         # Create a new input by replacing the background with noise
         new_input = input_label * (1 - bkg_mask) + noise * bkg_mask
