@@ -36,11 +36,13 @@ class MultiTissueDataset(Dataset):
 
 
 class MultiTissueDatasetNoisyBkg(MultiTissueDataset):
-    def __init__(self, data_concat, variance=1, mean=0.5):
+    def __init__(self, data_concat, variance=1, mean=0.5, ignore_bkg=False):
         super().__init__(data_concat)
         self.background_label = 3
         self.variance = variance
         self.mean = mean
+        self.ignore_bkg = ignore_bkg
+
     def __getitem__(self, idx):
         sample = super().__getitem__(idx)
         input_label = sample['input_label']
@@ -52,4 +54,8 @@ class MultiTissueDatasetNoisyBkg(MultiTissueDataset):
         new_input = input_label * (1 - bkg_mask) + noise * bkg_mask
         
         sample['input_label'] = new_input
+        if self.ignore_bkg:
+            sample['input_label'] = sample['input_label'][:-1]
         return sample
+
+
