@@ -61,10 +61,9 @@ class MultiTissueDatasetNoisyBkg(MultiTissueDataset):
 
 
 class DatasetDIDC(Dataset):
-    def __init__(self, data_path, grouping_rules, original_labels, new_labels, target_size=(384, 384), num_input_classes=4, rm_black_slices=False, load_all=True):
+    def __init__(self, data_path, grouping_rules, new_labels, target_size=(384, 384), num_input_classes=4, file_list=None, rm_black_slices=True):
         self.data_path = data_path
         self.grouping_rules = grouping_rules
-        self.original_labels = original_labels
         self.new_labels = new_labels
         self.target_size = target_size
         self.rm_black_slices = rm_black_slices
@@ -72,13 +71,15 @@ class DatasetDIDC(Dataset):
         assert os.path.isdir(self.data_path), f"Data path {self.data_path} does not exist or is not a directory."
         assert self.grouping_rules is not None, "Grouping rules must be provided for label remapping."
 
+        self.original_labels = self.load_original_labels()
         self.lut = self.generate_lut(self.grouping_rules, self.original_labels)
 
         foreground_list = []
         segm_masks_list = []
 
         # Load all data into memory and resize on the fly if needed
-        for counter, file in enumerate(sorted(os.listdir(self.data_path))):
+        files = sorted(os.listdir(self.data_path)) if file_list is None else file_list
+        for file in files:
             if file.endswith('.npy'):
                 pat = np.load(self.data_path + '/' + file, allow_pickle=True).item()                
 
@@ -97,10 +98,6 @@ class DatasetDIDC(Dataset):
                     
                 foreground_list.append(fg)
                 segm_masks_list.append(mask)
-            
-            if counter > 50 and not load_all: # just for testing purposes
-                print("Loaded first 50 patients, stopping for testing purposes.")
-                break
         
         # remap segmentation masks using LUT (only for multi tissue maps) and merge with foreground mask (union)
         self.fg_tensor = torch.cat(foreground_list, dim=0).long()
@@ -165,7 +162,20 @@ class DatasetDIDC(Dataset):
         segm_masks_tensor[where_details] = fg_remapped[where_details] # Final merge
 
         return segm_masks_tensor
-        
+    
+    def load_original_labels(self):
+        original_labels = []
+
+        if os.path.isfile(self.data_path + '/tissue_list.txt'):
+            with open (self.data_path + '/tissue_list.txt', 'r') as f:
+                for i, line in enumerate(f):
+                    if i > 1:
+                        line = line.strip().split()[-1]
+                        original_labels.append(line)
+            return ['Background'] + original_labels
+        else:
+            raise FileNotFoundError(f"Original labels file not found at {self.data_path + '/tissue_list.txt'}")
+
     def __len__(self):
         return self.fg_tensor.shape[0]
 
