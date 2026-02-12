@@ -1,7 +1,9 @@
+import os
 import torch
 from torch.utils.data import Dataset
 import numpy as np
 import torch.nn.functional as F
+import torchvision.transforms.functional as TF
 
 
 class MultiTissueDataset(Dataset):
@@ -34,7 +36,6 @@ class MultiTissueDataset(Dataset):
         return {'input_label': input_label_one_hot, 'multiClassMask': multiClassMask}
     
 
-
 class MultiTissueDatasetNoisyBkg(MultiTissueDataset):
     def __init__(self, data_concat, variance=1, mean=0.5, ignore_bkg=False):
         super().__init__(data_concat)
@@ -59,3 +60,114 @@ class MultiTissueDatasetNoisyBkg(MultiTissueDataset):
         return sample
 
 
+class DatasetDIDC(Dataset):
+    def __init__(self, data_path, grouping_rules, original_labels, new_labels, target_size=(384, 384), num_input_classes=4, rm_black_slices=False, load_all=True):
+        self.data_path = data_path
+        self.grouping_rules = grouping_rules
+        self.original_labels = original_labels
+        self.new_labels = new_labels
+        self.target_size = target_size
+        self.rm_black_slices = rm_black_slices
+
+        assert os.path.isdir(self.data_path), f"Data path {self.data_path} does not exist or is not a directory."
+        assert self.grouping_rules is not None, "Grouping rules must be provided for label remapping."
+
+        self.lut = self.generate_lut(self.grouping_rules, self.original_labels)
+
+        foreground_list = []
+        segm_masks_list = []
+
+        # Load all data into memory and resize on the fly if needed
+        for counter, file in enumerate(sorted(os.listdir(self.data_path))):
+            if file.endswith('.npy'):
+                pat = np.load(self.data_path + '/' + file, allow_pickle=True).item()                
+
+                fg = torch.from_numpy(pat['mask_foreground']).permute(2,0,1)
+                mask = torch.from_numpy(pat['interpolated_segmentation']).float().permute(2,0,1)
+
+                # Remove empty slices in the foreground if the option is enabled
+                if self.rm_black_slices:
+                    empty_slices_mask = self.check_black_foreground(fg)
+                    fg = fg[~empty_slices_mask, ...]
+                    mask = mask[~empty_slices_mask, ...]
+
+                if fg.shape[1] != self.target_size[0] or fg.shape[2] != self.target_size[1]:
+                    fg = TF.resize(fg, self.target_size, interpolation=TF.InterpolationMode.NEAREST)
+                    mask = TF.resize(mask, self.target_size, interpolation=TF.InterpolationMode.NEAREST)
+                    
+                foreground_list.append(fg)
+                segm_masks_list.append(mask)
+            
+            if counter > 50 and not load_all: # just for testing purposes
+                print("Loaded first 50 patients, stopping for testing purposes.")
+                break
+        
+        # remap segmentation masks using LUT (only for multi tissue maps) and merge with foreground mask (union)
+        self.fg_tensor = torch.cat(foreground_list, dim=0).long()
+        self.segm_masks_tensor = self.lut[torch.cat(segm_masks_list, dim=0).long()]
+        self.segm_masks_tensor = self.merge_fg_to_segm(self.fg_tensor, self.segm_masks_tensor, self.new_labels)
+
+        # One hot encode fg tensor
+        num_classes = self.fg_tensor.max().item() + 1
+        assert num_input_classes == num_classes, f"Number of input classes ({num_input_classes}) does not match the number of unique labels in the foreground ({num_classes})."
+        
+        self.fg_tensor = F.one_hot(self.fg_tensor, num_classes=num_input_classes).permute(0, 3, 1, 2)
+
+    @staticmethod
+    def check_black_foreground(mask):
+        assert mask.ndim == 3, "Input mask must be a 3D array (D, H, W)"
+        assert isinstance(mask, torch.Tensor), "Input mask must be a torch.Tensor"
+
+        flat_mask = mask.flatten(start_dim=1)
+
+        return flat_mask.sum(dim=1) == 0
+
+    @staticmethod
+    def generate_lut(grouping_rules, original_labels):
+        """
+        Generate a Look-Up Table (LUT) for remapping original labels to new grouped labels based on provided grouping rules.
+        The LUT is a numpy array where the (index +1) corresponds to the original label and the value at that index is the new grouped label index. 
+        The LUT should have a length of max(original_labels) + 1 to accommodate the "background" label as 0.
+        """
+        new_labels = sorted(list(set(grouping_rules.values())))
+        lut = np.zeros(len(original_labels), dtype=int)
+        for idx, label in enumerate(original_labels):
+            if label in grouping_rules:
+                group_name = grouping_rules[label]
+                group_idx = new_labels.index(group_name)
+                lut[idx] = group_idx
+            else:
+                print(f'Warning: Label "{label}" not found in grouping rules. Assigned to "Unknown".')
+        return torch.from_numpy(lut).long()
+
+    @staticmethod
+    def merge_fg_to_segm(fg_tensor, segm_masks_tensor, new_labels):
+        """
+        Merge the foreground tensor with the segmentation masks tensor (which must be already remapped to the new labels)
+        """
+        heart_generic_idx = new_labels.index("Heart_generic")
+        others_idx = new_labels.index("Others")
+
+        fg_mask_boolean = fg_tensor > 0
+
+        # Set all possible heart pixels to "Others" to account for fg mask to be bigger or smaller than the original heart segmentation ("Heart_generic")
+        segm_masks_tensor[segm_masks_tensor == heart_generic_idx] = others_idx
+        segm_masks_tensor[fg_mask_boolean] = others_idx
+
+        # Fg pixels remapping to match the labelling in the lut (which already includes the mapping for "LV_Myocardium", "LV_blood_pool", "RV_blood_pool_myocardium")
+        # label 1: LV_blood_pool, label 2: LV_Myocardium, label 3: RV_blood_pool_myocardium
+        fg_remapped = fg_tensor.clone() # to avoid problems in later steps
+        fg_remapped[fg_tensor == 1] = new_labels.index("LV_blood_pool")
+        fg_remapped[fg_tensor == 2] = new_labels.index("LV_Myocardium")
+        fg_remapped[fg_tensor == 3] = new_labels.index("RV_blood_pool_myocardium")
+
+        where_details = fg_tensor > 0 # Tmp mask to ignore 0 values in fg_remapped that would be remapped to the 0 index which has meaning
+        segm_masks_tensor[where_details] = fg_remapped[where_details] # Final merge
+
+        return segm_masks_tensor
+        
+    def __len__(self):
+        return self.fg_tensor.shape[0]
+
+    def __getitem__(self, idx):
+        return {'input_label': self.fg_tensor[idx].float(), 'multiClassMask': self.segm_masks_tensor[idx]}
