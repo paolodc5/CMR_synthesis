@@ -7,21 +7,18 @@ from itertools import cycle
 from datetime import datetime
 import json
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2,3"
 
 import torch
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
 from torch import device, nn, optim
 
-from utils import (load_all_data, 
-                   squeeze_and_concat, 
-                   filter_mask_keep_labels, 
-                   multiclass_dice_loss,
+from utils import (multiclass_dice_loss,
                    set_reproducibility)
 from datasets import DatasetDIDC
 from unet_advanced import UNetAdvanced as UNetGan
-from gan_basic import DiscriminatorModel
+from gan_multidiscr import MultiScaleDiscriminator
 from train_utils import EarlyStopping, save_checkpoint
 from mt_DIDC_config import GROUPING_RULES, NEW_LABELS
 
@@ -32,7 +29,7 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 SEED = 187
 set_reproducibility(SEED)
 
-RUN_NAME = "MT_DIDC_basic_gan"
+RUN_NAME = "MT_DIDC_multiscale_gan"
 TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M")
 EXP_DIR = f"./experiments/DIDC/{TIMESTAMP}_{RUN_NAME}"
 
@@ -45,14 +42,15 @@ N_DISCR_STEPS = 1
 N_GEN_STEPS = 1
 VAL_CHECK_INTERVAL = 120
 LAMBDA_CE = 10.0
+LAMBDA_PERC = 0.0
 DROPOUT_GEN = 0.3
+NUM_DISCRIMINATORS = 4
 GEN_LR = 1e-4
 DISCR_LR = 1e-5
-NUM_DISCRIMINATORS = 4
 PATIENCE_ES = 15 # num * VAL_CHECK_INTERVAL steps with no improvement
 DELTA_ES = 0.01 # minimum improvement in validation dice loss to reset early stopping counter
 BATCH_SIZE = 16
-NOTES="Basic GAN training on DIDC data trained for longer"
+NOTES="Mutliscale gan on DIDC data with 4 discriminators and NO perceptual loss"
 PARALLEL = True
 
 
@@ -72,8 +70,8 @@ def train_discriminator(batch, gen, discr, criterion_GAN, optim_discr, device='c
     discr_real = discr(discr_input_real) # Discrim forward pass on real pairs
     discr_fake = discr(discr_input_fake) # Discrim forward pass on fake pairs
 
-    loss = criterion_GAN(discr_real, torch.ones_like(discr_real)) + \
-        criterion_GAN(discr_fake, torch.zeros_like(discr_fake))
+    loss = compute_multiscale_loss(discr_real, target=1, criterion=criterion_GAN) + \
+        compute_multiscale_loss(discr_fake, target=0, criterion=criterion_GAN)
 
     optim_discr.zero_grad()
     loss.backward()
@@ -81,7 +79,7 @@ def train_discriminator(batch, gen, discr, criterion_GAN, optim_discr, device='c
 
     return loss.item()
 
-def train_generator(batch, gen, discr, criterion_GAN, criterion_CE, optim_gen, lambda_ce, device='cpu'):
+def train_generator(batch, gen, discr, criterion_GAN, criterion_CE, criterion_perc, optim_gen, lambda_ce, lambda_perc, device='cpu'):
     input = batch['input_label'].to(device)
     gt = batch['multiClassMask'].to(device)
     
@@ -91,23 +89,30 @@ def train_generator(batch, gen, discr, criterion_GAN, criterion_CE, optim_gen, l
     discr_input_fake = torch.cat([input, gen_img_probs], dim=1)  # Fake pairs: input + generated segmentation (probs)
     discr_fake = discr(discr_input_fake) # Discrim forward pass on fake pairs
 
+    gt_onehot = torch.zeros_like(gen_img_probs).scatter_(1, gt.unsqueeze(1), 1.0) # Assigns 1.0 in the corresponding class channel based on gt indices (0-11)
+    discr_input_real = torch.cat([input, gt_onehot], dim=1)  # Real pairs: input + gt
+    
+    with torch.no_grad(): # Important otherwise I updated the discriminator's gradients while training the generator. 
+        discr_real = discr(discr_input_real) # Discrim forward pass on real pairs
 
+    perc_loss = compute_perceptual_loss(discr_real, discr_fake, criterion_perc)
     ce_loss = criterion_CE(gen_img, gt)  # CE loss between generated segmentation and ground truth (B, 12, H, W)
-    loss_gen = criterion_GAN(discr_fake, torch.ones_like(discr_fake)) + lambda_ce * ce_loss
+    loss_gen = compute_multiscale_loss(discr_fake, target=1, criterion=criterion_GAN) + lambda_ce * ce_loss + lambda_perc * perc_loss
 
     optim_gen.zero_grad()
     loss_gen.backward()
     optim_gen.step()
 
-    return loss_gen.item(), ce_loss.item()
+    return loss_gen.item(), ce_loss.item(), perc_loss.item()
 
-def validate_generator(val_dataloader, gen, discr, criterion_GAN, criterion_CE, lambda_ce, device='cpu'):
+def validate_generator(val_dataloader, gen, discr, criterion_GAN, criterion_CE, criterion_perc, lambda_ce, lambda_perc, device='cpu'):
     gen.eval()
     discr.eval()
 
     total_gan_loss = 0.0
     total_ce_loss = 0.0
     total_dice_loss = 0.0
+    total_perc_loss = 0.0
     num_batches = 0
 
     with torch.no_grad():
@@ -121,32 +126,40 @@ def validate_generator(val_dataloader, gen, discr, criterion_GAN, criterion_CE, 
             discr_input_fake = torch.cat([input, gen_img_probs], dim=1)
             discr_fake = discr(discr_input_fake)
 
+            gt_onehot = torch.zeros_like(gen_img_probs).scatter_(1, gt.unsqueeze(1), 1.0) # Assigns 1.0 in the corresponding class channel based on gt indices (0-11)
+            discr_input_real = torch.cat([input, gt_onehot], dim=1)  # Real pairs: input + gt
+            discr_real = discr(discr_input_real)
+
             # Compute losses
             ce_loss = criterion_CE(gen_img, gt)
-            gan_loss = criterion_GAN(discr_fake, torch.ones_like(discr_fake))
+            gan_loss = compute_multiscale_loss(discr_fake, target=1, criterion=criterion_GAN)
             dice_loss = multiclass_dice_loss(gen_img, gt) # Logits here as input
-
+            perc_loss = compute_perceptual_loss(discr_real, discr_fake, criterion_perc)
             total_gan_loss += gan_loss.item()
             total_ce_loss += ce_loss.item()
             total_dice_loss += dice_loss.item()
+            total_perc_loss += perc_loss.item()
             num_batches += 1
 
     avg_gan_loss = total_gan_loss / num_batches
     avg_ce_loss = total_ce_loss / num_batches
     avg_dice_loss = total_dice_loss / num_batches
+    avg_perc_loss = total_perc_loss / num_batches
 
-    return avg_gan_loss, avg_ce_loss, avg_dice_loss
+    return avg_gan_loss, avg_ce_loss, avg_dice_loss, avg_perc_loss
 
-def train_gan(num_steps, n_discr_steps, n_gen_steps, val_check_interval, gen, discr, dataloader, val_dataloader, criterion_GAN, criterion_CE, optim_gen, optim_discr, lambda_ce, es, device, exp_dir):
+def train_gan(num_steps, n_discr_steps, n_gen_steps, val_check_interval, gen, discr, dataloader, val_dataloader, criterion_GAN, criterion_CE, criterion_perc, optim_gen, optim_discr, lambda_ce, lambda_perc, es, device, exp_dir):
     pbar = tqdm(range(num_steps), desc="Training step", file=sys.__stderr__)
     
     metrics_history = {
         'train_D_loss': [],
         'train_G_loss': [],
         'train_CE_loss': [],
+        'train_Perc_loss': [],
         'val_G_loss': [],
         'val_CE_loss': [],
         'val_Dice_loss': [],
+        'val_Perc_loss': [],
         'current_step': 0.0
     }
 
@@ -166,25 +179,30 @@ def train_gan(num_steps, n_discr_steps, n_gen_steps, val_check_interval, gen, di
 
         loss_gen = 0.0
         ce_loss = 0.0
+        perc_loss = 0.0
         for _ in range(n_gen_steps): # Nested loop to allow multiple generator updates per discriminator update
-            running_loss_gen, running_ce_loss = train_generator(batch, gen, discr, criterion_GAN, criterion_CE, optim_gen, lambda_ce, device)
+            running_loss_gen, running_ce_loss, running_perc_loss = train_generator(batch, gen, discr, criterion_GAN, criterion_CE, criterion_perc, optim_gen, lambda_ce, lambda_perc, device)
             loss_gen += running_loss_gen
             ce_loss += running_ce_loss
+            perc_loss += running_perc_loss
         loss_gen /= n_gen_steps
         ce_loss /= n_gen_steps
+        perc_loss /= n_gen_steps
 
         metrics_history['train_D_loss'].append(loss_discr)
         metrics_history['train_G_loss'].append(loss_gen)
         metrics_history['train_CE_loss'].append(ce_loss)
+        metrics_history['train_Perc_loss'].append(perc_loss)
         metrics_history['current_step'] = step
 
         if step % val_check_interval == 0 and step > 0: # Validate every val_check_interval steps
-            val_gan_loss, val_ce_loss, val_dice_loss = validate_generator(val_dataloader, gen, discr, criterion_GAN, criterion_CE, lambda_ce, device)
+            val_gan_loss, val_ce_loss, val_dice_loss, val_perc_loss = validate_generator(val_dataloader, gen, discr, criterion_GAN, criterion_CE, criterion_perc, lambda_ce, lambda_perc, device)
             metrics_history['val_G_loss'].append(val_gan_loss)
             metrics_history['val_CE_loss'].append(val_ce_loss)
             metrics_history['val_Dice_loss'].append(val_dice_loss)
+            metrics_history['val_Perc_loss'].append(val_perc_loss)
 
-            print(f"VAL: Step {step}: Val GAN Loss: {val_gan_loss:.4f}, Val CE Loss: {val_ce_loss:.4f}, Val Dice Loss: {val_dice_loss:.4f}")
+            print(f"VAL: Step {step}: Val GAN Loss: {val_gan_loss:.4f}, Val CE Loss: {val_ce_loss:.4f}, Val Dice Loss: {val_dice_loss:.4f}, Val Perc Loss: {val_perc_loss:.4f}")
 
             # Save checkpoint
             save_checkpoint(exp_dir, step, gen, discr, optim_gen, optim_discr, metrics_history)
@@ -200,12 +218,12 @@ def train_gan(num_steps, n_discr_steps, n_gen_steps, val_check_interval, gen, di
         if step % 20 == 0: # Update progress bar every 20 steps
             print(f"Step {step}: Train D Loss: {loss_discr:.4f}, Train G Loss: {loss_gen:.4f}, Train CE Loss: {ce_loss:.4f}")
             pbar.set_postfix({
-                'D': f'{loss_discr:.4f}', 
-                'G': f'{loss_gen:.4f}',
-                'CE': f'{ce_loss:.4f}',
-                'val_G': f'{val_gan_loss:.4f}' if step >= val_check_interval else 'N/A',
-                'val_CE': f'{val_ce_loss:.4f}' if step >= val_check_interval else 'N/A',
-                'val_Dice': f'{val_dice_loss:.4f}' if step >= val_check_interval else 'N/A'
+                'train_D_loss': f'{loss_discr:.4f}', 
+                'train_G_loss': f'{loss_gen:.4f}',
+                'train_CE_loss': f'{ce_loss:.4f}',
+                'val_G_loss': f'{val_gan_loss:.4f}' if step >= val_check_interval else 'N/A',
+                'val_CE_loss': f'{val_ce_loss:.4f}' if step >= val_check_interval else 'N/A',
+                'val_Dice_loss': f'{val_dice_loss:.4f}' if step >= val_check_interval else 'N/A'
             })
     
     # Save metrics history to a JSON file
@@ -213,6 +231,44 @@ def train_gan(num_steps, n_discr_steps, n_gen_steps, val_check_interval, gen, di
         json.dump(metrics_history, f, indent=4)
 
     return metrics_history
+
+def compute_multiscale_loss(discr_outputs, target, criterion):
+    """
+    Function to compute GAN loss (BCEWithLogitsLoss) averaged across multiple discriminators in the MultiScaleDiscriminator.
+    
+    :param discr_outputs: List of tuples containing discriminator outputs and features (See MultiScaleDiscriminator forward method)
+    :param target: integer (1 for real, 0 for fake) to create target tensors for GAN loss computation
+    :param criterion: Loss function to compute the GAN loss (e.g., BCEWithLogitsLoss)
+    :return: Computed GAN loss averaged across all discriminators
+    """
+    loss = 0.0
+    for pred, _ in discr_outputs:
+        target_tensor = torch.ones_like(pred) if target == 1 else torch.zeros_like(pred)
+        loss += criterion(pred, target_tensor) 
+    
+    return loss/len(discr_outputs)
+
+def compute_perceptual_loss(discr_real, discr_fake, criterion_L1):
+    """
+    Function to compute perceptual loss between features from the generated image and features from the ground truth image.
+    
+    :param discr_real: List of tuples containing discriminator outputs and features for real images
+    :param discr_fake: List of tuples containing discriminator outputs and features for fake images
+    :param criterion_L1: Loss function to compute the perceptual loss (e.g., L1Loss or MSELoss)
+    :return: Computed perceptual loss averaged across all feature map pairs
+    """
+    total_loss = 0.0
+    for real_pred, fake_pred in zip(discr_real, discr_fake):
+        real_feat = real_pred[1] # Get features from the discriminator's forward pass on real pairs
+        fake_feat = fake_pred[1] # Get features from the discriminator's forward pass on fake pairs
+        
+        loss_discr = 0.0
+        for rf, ff in zip(real_feat, fake_feat):
+            loss_layer = criterion_L1(ff, rf.detach()) # Compute L1 loss between fake and real features
+            loss_discr += loss_layer
+            
+        total_loss += loss_discr # just a sum not a mean
+    return total_loss
 
 def main():
     cuda_env = os.environ.get('CUDA_VISIBLE_DEVICES')
@@ -260,7 +316,7 @@ def main():
     n_input_classes = 4
     n_output_classes = len(train_dataset.new_labels)
     gen = UNetGan(in_ch=n_input_classes, num_classes=n_output_classes, dropout_p=DROPOUT_GEN).to(DEVICE)
-    discr = DiscriminatorModel(in_ch=n_input_classes+n_output_classes, base_ch=64).to(DEVICE)
+    discr = MultiScaleDiscriminator(in_ch=n_input_classes+n_output_classes, n_discriminators=NUM_DISCRIMINATORS).to(DEVICE)
 
     if torch.cuda.device_count() > 1 and PARALLEL:
         print(f"Using {torch.cuda.device_count()} GPUs for training.")
@@ -269,6 +325,7 @@ def main():
 
     criterion_GAN = nn.BCEWithLogitsLoss()
     criterion_CE = nn.CrossEntropyLoss() # CE loss for segmentation (better than L1 for classification tasks)
+    criterion_perc = nn.L1Loss() # L1 loss for perceptual loss on discriminator features (could also try MSELoss)
 
     optim_gen = optim.Adam(gen.parameters(), lr=GEN_LR)
     optim_discr = optim.Adam(discr.parameters(), lr=DISCR_LR)
@@ -280,6 +337,8 @@ def main():
         'num_steps': NUM_STEPS,
         'n_discr_steps': N_DISCR_STEPS,
         'lambda_ce': LAMBDA_CE,
+        'lambda_perc': LAMBDA_PERC,
+        'num_discriminators': NUM_DISCRIMINATORS,
         'val_check_interval': VAL_CHECK_INTERVAL,
         'batch_size': train_dataloader.batch_size,
         'learning_rate_gen': optim_gen.param_groups[0]['lr'],
@@ -311,9 +370,11 @@ def main():
                         val_dataloader,
                         criterion_GAN, 
                         criterion_CE, 
+                        criterion_perc,
                         optim_gen, 
                         optim_discr, 
                         LAMBDA_CE, 
+                        LAMBDA_PERC,
                         es, 
                         DEVICE,
                         EXP_DIR)

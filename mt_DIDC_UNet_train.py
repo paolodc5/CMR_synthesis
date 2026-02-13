@@ -214,7 +214,7 @@ def main():
 
     model, metrics = train(model, train_dataloader, val_dataloader, criterion, optimizer, scheduler, early_stopping, EPOCHS, DEVICE)
 
-    with open(f"{EXP_DIR}/metric_history.json", "w") as f:
+    with open(f"{EXP_DIR}/metrics_history.json", "w") as f:
         json.dump(metrics, f, indent=4)
     
     torch.save(model.state_dict(), f"{EXP_DIR}/model_final.pth")
