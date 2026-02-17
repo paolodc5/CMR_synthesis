@@ -1,9 +1,11 @@
 import os
 import torch
 from torch.utils.data import Dataset
-import numpy as np
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
+import numpy as np
+from scipy.spatial import cKDTree
+from scipy.stats import mode
 
 
 class MultiTissueDataset(Dataset):
@@ -61,12 +63,13 @@ class MultiTissueDatasetNoisyBkg(MultiTissueDataset):
 
 
 class DatasetDIDC(Dataset):
-    def __init__(self, data_path, grouping_rules, new_labels, target_size=(384, 384), num_input_classes=4, file_list=None, rm_black_slices=True):
+    def __init__(self, data_path, grouping_rules, new_labels, target_size=(384, 384), num_input_classes=4, file_list=None, rm_black_slices=True, remap_nn=False):
         self.data_path = data_path
         self.grouping_rules = grouping_rules
         self.new_labels = new_labels
         self.target_size = target_size
         self.rm_black_slices = rm_black_slices
+        self.remap_nn = remap_nn
 
         assert os.path.isdir(self.data_path), f"Data path {self.data_path} does not exist or is not a directory."
         assert self.grouping_rules is not None, "Grouping rules must be provided for label remapping."
@@ -99,9 +102,15 @@ class DatasetDIDC(Dataset):
                 foreground_list.append(fg)
                 segm_masks_list.append(mask)
         
-        # remap segmentation masks using LUT (only for multi tissue maps) and merge with foreground mask (union)
         self.fg_tensor = torch.cat(foreground_list, dim=0).long()
-        self.segm_masks_tensor = self.lut[torch.cat(segm_masks_list, dim=0).long()]
+        self.segm_masks_tensor = torch.cat(segm_masks_list, dim=0).long()
+
+        # NN remapping of "Other_tissue" pixels to the most common label among their k nearest neighbors that are not "Other_tissue"
+        if self.remap_nn:
+            self.segm_masks_tensor = self.remap_NN(self.segm_masks_tensor.numpy(), self.original_labels.index("Other_tissue"), k=12) 
+
+        # remap segmentation masks using LUT (only for multi tissue maps) and merge with foreground mask (union)
+        self.segm_masks_tensor = self.lut[self.segm_masks_tensor]
         self.segm_masks_tensor = self.merge_fg_to_segm(self.fg_tensor, self.segm_masks_tensor, self.new_labels)
 
         # One hot encode fg tensor
@@ -163,6 +172,49 @@ class DatasetDIDC(Dataset):
 
         return segm_masks_tensor
     
+    @staticmethod
+    def remap_NN(segm_mask, other_tissue_idx, k=12):
+        """
+        Remap "Other_tissue" pixels in the segmentation mask to the most common label among their k nearest neighbors that are not "Other_tissue".
+        """
+
+        # If the input is 3D, apply the function slice by slice
+        if segm_mask.ndim == 3:
+            print(f"Running NN filling on {segm_mask.shape[0]} slices...")
+            cleaned_slices = [DatasetDIDC.remap_NN(s, other_tissue_idx, k) for s in segm_mask]
+            return np.stack(cleaned_slices)
+        
+        # 2D case
+        remap_segm = segm_mask.copy()
+
+        valid_pixels = (segm_mask != other_tissue_idx) # piexls NOT Other_tissue
+        valid_coords = np.argwhere(valid_pixels)
+        valid_labels = segm_mask[valid_coords[:,0], valid_coords[:,1]] # this is for majority voting
+
+        target_mask = segm_mask == other_tissue_idx
+        target_indices = np.argwhere(target_mask) # Other tissue coordinates
+
+        assert len(valid_coords) != 0, "No valid pixels found for NN search."
+
+        if len(target_indices) == 0:
+            print("No Other_tissue pixels found. No remapping needed.")
+            return remap_segm
+        else:
+            tree = cKDTree(valid_coords)
+            distances, nn_indices = tree.query(target_indices, k=k)
+            neighbor_labels = valid_labels[nn_indices] # shape (num_target_pixels, k)
+
+            if k > 1:
+                majority_labels, _ = mode(neighbor_labels, axis=1)
+                majority_labels = majority_labels.flatten()
+            else:
+                majority_labels = neighbor_labels.flatten()
+
+            remap_segm[target_mask] = majority_labels # New label assignment
+            # print('N. pixels different after re-mapping:', np.sum(~np.equal(segm_mask, remap_segm))) # Debug info
+
+            return remap_segm
+
     def load_original_labels(self):
         original_labels = []
 

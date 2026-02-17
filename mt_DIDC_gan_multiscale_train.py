@@ -7,7 +7,7 @@ from itertools import cycle
 from datetime import datetime
 import json
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "2,3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 
 import torch
 from torch.utils.data import DataLoader
@@ -29,7 +29,7 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 SEED = 187
 set_reproducibility(SEED)
 
-RUN_NAME = "MT_DIDC_multiscale_gan"
+RUN_NAME = "MT_DIDC_multiscale_NN_remapping"
 TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M")
 EXP_DIR = f"./experiments/DIDC/{TIMESTAMP}_{RUN_NAME}"
 
@@ -50,8 +50,9 @@ DISCR_LR = 1e-5
 PATIENCE_ES = 15 # num * VAL_CHECK_INTERVAL steps with no improvement
 DELTA_ES = 0.01 # minimum improvement in validation dice loss to reset early stopping counter
 BATCH_SIZE = 16
-NOTES="Mutliscale gan on DIDC data with 4 discriminators and NO perceptual loss"
+NOTES="Mutliscale gan on DIDC data, dataset with remapping of 'other_tissue' pixels to their NNs, perceptual loss and lr as originally"
 PARALLEL = True
+REMAP_NN = True # Whether to apply the NN remapping of "Other_tissue" pixels to the most common label among their k nearest neighbors that are not "Other_tissue". This is done in the DatasetDIDC class and can be turned on/off with this flag.
 
 
 def train_discriminator(batch, gen, discr, criterion_GAN, optim_discr, device='cpu'):
@@ -207,6 +208,10 @@ def train_gan(num_steps, n_discr_steps, n_gen_steps, val_check_interval, gen, di
             # Save checkpoint
             save_checkpoint(exp_dir, step, gen, discr, optim_gen, optim_discr, metrics_history)
 
+            # Save metrics history to a JSON file
+            with open(f"{exp_dir}/metrics_history.json", "w") as f:
+                json.dump(metrics_history, f, indent=4)
+            
             # check for early stopping based on validation dice score
             es.check_early_stop(val_dice_loss)
             if es.no_improvement_count == 0 and step > 0: # Save best model based on validation dice score
@@ -214,6 +219,8 @@ def train_gan(num_steps, n_discr_steps, n_gen_steps, val_check_interval, gen, di
             if es.stop_training:
                 print(f"Early stopping triggered at step {step}")
                 break
+
+
         
         if step % 20 == 0: # Update progress bar every 20 steps
             print(f"Step {step}: Train D Loss: {loss_discr:.4f}, Train G Loss: {loss_gen:.4f}, Train CE Loss: {ce_loss:.4f}")
@@ -225,10 +232,6 @@ def train_gan(num_steps, n_discr_steps, n_gen_steps, val_check_interval, gen, di
                 'val_CE_loss': f'{val_ce_loss:.4f}' if step >= val_check_interval else 'N/A',
                 'val_Dice_loss': f'{val_dice_loss:.4f}' if step >= val_check_interval else 'N/A'
             })
-    
-    # Save metrics history to a JSON file
-    with open(f"{exp_dir}/metrics_history.json", "w") as f:
-        json.dump(metrics_history, f, indent=4)
 
     return metrics_history
 
@@ -305,8 +308,8 @@ def main():
             'new_labels': NEW_LABELS
         }, f, indent=4)
 
-    train_dataset = DatasetDIDC(DATA_FOLDER, GROUPING_RULES, NEW_LABELS, target_size=TARGET_SIZE, rm_black_slices=True, file_list=train_files)    
-    val_dataset = DatasetDIDC(DATA_FOLDER, GROUPING_RULES, NEW_LABELS, target_size=TARGET_SIZE, rm_black_slices=True, file_list=val_files)    
+    train_dataset = DatasetDIDC(DATA_FOLDER, GROUPING_RULES, NEW_LABELS, target_size=TARGET_SIZE, rm_black_slices=True, file_list=train_files, remap_nn=REMAP_NN)    
+    val_dataset = DatasetDIDC(DATA_FOLDER, GROUPING_RULES, NEW_LABELS, target_size=TARGET_SIZE, rm_black_slices=True, file_list=val_files, remap_nn=REMAP_NN)    
 
     train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
     val_dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
@@ -343,6 +346,7 @@ def main():
         'batch_size': train_dataloader.batch_size,
         'learning_rate_gen': optim_gen.param_groups[0]['lr'],
         'learning_rate_discr': optim_discr.param_groups[0]['lr'],
+        'remapping_nn': REMAP_NN,
         'batch_size': BATCH_SIZE,
         'notes': NOTES,
         'patience_es': PATIENCE_ES,
