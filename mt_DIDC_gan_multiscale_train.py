@@ -7,7 +7,7 @@ from itertools import cycle
 from datetime import datetime
 import json
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2,3"
 
 import torch
 from torch.utils.data import DataLoader
@@ -50,7 +50,7 @@ DISCR_LR = 1e-5
 PATIENCE_ES = 15 # num * VAL_CHECK_INTERVAL steps with no improvement
 DELTA_ES = 0.01 # minimum improvement in validation dice loss to reset early stopping counter
 BATCH_SIZE = 16
-NOTES="Mutliscale gan on DIDC data, dataset with remapping of 'other_tissue' pixels to their NNs, perceptual loss and lr as originally"
+NOTES="Mutliscale gan on DIDC data, dataset with remapping of 'other_tissue' pixels to their NNs, perceptual loss added and lr as originally"
 PARALLEL = True
 REMAP_NN = True # Whether to apply the NN remapping of "Other_tissue" pixels to the most common label among their k nearest neighbors that are not "Other_tissue". This is done in the DatasetDIDC class and can be turned on/off with this flag.
 

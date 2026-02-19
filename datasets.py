@@ -6,6 +6,7 @@ import torchvision.transforms.functional as TF
 import numpy as np
 from scipy.spatial import cKDTree
 from scipy.stats import mode
+from tqdm import tqdm
 
 
 class MultiTissueDataset(Dataset):
@@ -64,7 +65,7 @@ class MultiTissueDatasetNoisyBkg(MultiTissueDataset):
 
 class BaseDatasetDIDC(Dataset):
     def __init__(self, data_path, grouping_rules, new_labels, target_size=(384, 384), 
-                 num_input_classes=4, original_labels=None, rm_black_slices=True, remap_nn=False):
+                 num_input_classes=4, original_labels=None, rm_black_slices=True, remap_nn=False, threshold_classes=50):
         
         self.data_path = data_path
         self.grouping_rules = grouping_rules
@@ -73,13 +74,14 @@ class BaseDatasetDIDC(Dataset):
         self.rm_black_slices = rm_black_slices
         self.remap_nn = remap_nn
         self.num_input_classes = num_input_classes
+        self.threshold_classes = threshold_classes
 
         assert os.path.isdir(self.data_path), f"Path {self.data_path} non esiste."
         assert self.grouping_rules is not None, "Grouping rules mancanti."
 
         # Load original labels and generate LUT for remapping
         self.original_labels = self.load_original_labels() if original_labels is None else original_labels
-        self.lut = self.generate_lut(self.grouping_rules, self.original_labels)
+        self.lut = self.generate_lut(self.grouping_rules, self.original_labels, self.new_labels)
 
     def process_slice(self, fg, mask):
         """
@@ -95,6 +97,8 @@ class BaseDatasetDIDC(Dataset):
             mask_np = mask.numpy()
             other_idx = self.original_labels.index("Other_tissue")
             
+            protected_indices = [self.original_labels.index(label) for label in ['Background', 'Other_tissue', 'Heart']] # to avoid remapping of the new labels that are not "Others" (e.g. "Heart_generic") that could be affected by the NN remapping if they are close to "Other_tissue" pixels
+            mask = self.filter_underrepresented_classes(mask=mask, min_pixels=self.threshold_classes, other_idx=other_idx, protected_indices=protected_indices)
             mask_np = self.remap_NN(mask_np, other_idx)
             mask = torch.from_numpy(mask_np).long()
 
@@ -123,13 +127,12 @@ class BaseDatasetDIDC(Dataset):
         return flat_mask.sum(dim=1) == 0
 
     @staticmethod
-    def generate_lut(grouping_rules, original_labels):
+    def generate_lut(grouping_rules, original_labels, new_labels):
         """
         Generate a Look-Up Table (LUT) for remapping original labels to new grouped labels based on provided grouping rules.
         The LUT is a numpy array where the (index +1) corresponds to the original label and the value at that index is the new grouped label index. 
         The LUT should have a length of max(original_labels) + 1 to accommodate the "background" label as 0.
         """
-        new_labels = sorted(list(set(grouping_rules.values())))
         lut = np.zeros(len(original_labels), dtype=int)
         for idx, label in enumerate(original_labels):
             if label in grouping_rules:
@@ -167,6 +170,32 @@ class BaseDatasetDIDC(Dataset):
         return segm_masks_tensor
     
     @staticmethod
+    def filter_underrepresented_classes(mask, min_pixels, other_idx, protected_indices):
+        """
+        Scans the mask and subsitutes classese with less than min_pixels with other_idx, except for those in protected_indices
+        Compatible with both 2D and 3D masks
+        """
+        protected_set = set(protected_indices)
+
+        if mask.ndim == 3:
+            for i in range(mask.shape[0]):
+                slice_mask = mask[i]
+                unique_vals, counts = torch.unique(slice_mask, return_counts=True)
+                for val, count in zip(unique_vals, counts):
+                    v = val.item()
+                    if v not in protected_set and count.item() < min_pixels:
+                        slice_mask[slice_mask == v] = other_idx
+                        
+        elif mask.ndim == 2:
+            unique_vals, counts = torch.unique(mask, return_counts=True)
+            for val, count in zip(unique_vals, counts):
+                v = val.item()
+                if v not in protected_set and count.item() < min_pixels:
+                    mask[mask == v] = other_idx
+
+        return mask
+
+    @staticmethod
     def remap_NN(segm_mask, other_tissue_idx, k=12):
         """
         Remap "Other_tissue" pixels in the segmentation mask to the most common label among their k nearest neighbors that are not "Other_tissue".
@@ -174,7 +203,6 @@ class BaseDatasetDIDC(Dataset):
 
         # If the input is 3D, apply the function slice by slice
         if segm_mask.ndim == 3:
-            print(f"Running NN filling on {segm_mask.shape[0]} slices...")
             cleaned_slices = [BaseDatasetDIDC.remap_NN(s, other_tissue_idx, k) for s in segm_mask]
             return np.stack(cleaned_slices)
         
@@ -238,7 +266,7 @@ class RAMDatasetDIDC(BaseDatasetDIDC):
         fg_list = []
         mask_list = []
 
-        for file in files:
+        for file in tqdm(files):
             if file.endswith('.npy'):
                 try:
                     pat = np.load(os.path.join(self.data_path, file), allow_pickle=True).item()
@@ -250,6 +278,8 @@ class RAMDatasetDIDC(BaseDatasetDIDC):
                         fg = fg[valid]
                         mask = mask[valid]
 
+                    fg, mask = self.process_slice(fg, mask) # preprocess in the loop
+
                     fg_list.append(fg)
                     mask_list.append(mask)
                 except Exception as e:
@@ -257,10 +287,6 @@ class RAMDatasetDIDC(BaseDatasetDIDC):
 
         self.fg_tensor = torch.cat(fg_list, dim=0)
         self.mask_tensor = torch.cat(mask_list, dim=0)
-
-        print("Tensor preprocessing ...")
-        self.fg_tensor, self.mask_tensor = self.process_slice(self.fg_tensor, self.mask_tensor)
-        print(f"Done. Number of samples: {len(self.fg_tensor)}")
 
     def __len__(self):
         return len(self.fg_tensor)
