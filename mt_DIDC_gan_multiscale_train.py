@@ -16,7 +16,7 @@ from torch import device, nn, optim
 
 from utils import (multiclass_dice_loss,
                    set_reproducibility)
-from datasets import DatasetDIDC
+from datasets import DatasetDIDC, LazyDatasetDIDC
 from unet_advanced import UNetAdvanced as UNetGan
 from gan_multidiscr import MultiScaleDiscriminator
 from train_utils import EarlyStopping, save_checkpoint
@@ -29,12 +29,9 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 SEED = 187
 set_reproducibility(SEED)
 
-RUN_NAME = "MT_DIDC_multiscale_NN_remapping"
+RUN_NAME = "MT_DIDC_multiscale"
 TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M")
 EXP_DIR = f"./experiments/DIDC/{TIMESTAMP}_{RUN_NAME}"
-
-VAL_FRACTION = 0.2
-TARGET_SIZE = (384, 384) # Target size for resizing the input images and masks (H, W)
 
 # Hyperparameters (not best practice to be defined here)
 NUM_STEPS = 15000
@@ -50,9 +47,20 @@ DISCR_LR = 1e-5
 PATIENCE_ES = 15 # num * VAL_CHECK_INTERVAL steps with no improvement
 DELTA_ES = 0.01 # minimum improvement in validation dice loss to reset early stopping counter
 BATCH_SIZE = 16
-NOTES="Mutliscale gan on DIDC data, dataset with remapping of 'other_tissue' pixels to their NNs, perceptual loss added and lr as originally"
+VAL_FRACTION = 0.2
+NOTES="Mutliscale gan on DIDC dataset FIXED with new preprocessing, dataset with remapping of 'other_tissue' pixels to their NNs, perceptual loss added and lr as originally"
 PARALLEL = True
+
+LAZY_DATASET = True
+NUM_WORKERS = 8 if LAZY_DATASET else 0 # Set num_workers > 0 only for LazyDataset to speed up data loading, for in-memory dataset it can cause unnecessary overhead and potential issues with multiprocessing on some platforms (e.g., Windows)
+PIN_MEMORY = False # Set pin_memory to True only for LazyDataset to speed up data transfer to GPU, for in-memory dataset it can cause unnecessary overhead
+NON_BLOCKING_GPU_LOADING = PIN_MEMORY # Set non_blocking to True only for LazyDataset to allow asynchronous GPU transfers, for in-memory dataset it can cause issues if the data is already on CPU and not pinned
+
+# preprocessing hyperparameters
 REMAP_NN = True # Whether to apply the NN remapping of "Other_tissue" pixels to the most common label among their k nearest neighbors that are not "Other_tissue". This is done in the DatasetDIDC class and can be turned on/off with this flag.
+THRESHOLD_CLASSES = 50 # Minimum number of pixels for a class to be kept, otherwise those pixels are set to "Other_tissue". Set to None to disable this step. 
+MIN_BLOB_SIZE = 10 # Minimum size of connected components to keep for each class, smaller blobs are removed. Set to None to disable this step.
+TARGET_SIZE = (384, 384) # Target size for resizing the input images and masks (H, W)
 
 
 def train_discriminator(batch, gen, discr, criterion_GAN, optim_discr, device='cpu'):
@@ -81,8 +89,8 @@ def train_discriminator(batch, gen, discr, criterion_GAN, optim_discr, device='c
     return loss.item()
 
 def train_generator(batch, gen, discr, criterion_GAN, criterion_CE, criterion_perc, optim_gen, lambda_ce, lambda_perc, device='cpu'):
-    input = batch['input_label'].to(device)
-    gt = batch['multiClassMask'].to(device)
+    input = batch['input_label'].to(device, non_blocking=NON_BLOCKING_GPU_LOADING) # Models passed to the function should be already on the same device
+    gt = batch['multiClassMask'].to(device, non_blocking=NON_BLOCKING_GPU_LOADING)
     
     gen_img = gen(input)
     gen_img_probs = gen_img.softmax(dim=1)  # Now with gradients enablesd for generator training
@@ -308,11 +316,11 @@ def main():
             'new_labels': NEW_LABELS
         }, f, indent=4)
 
-    train_dataset = DatasetDIDC(DATA_FOLDER, GROUPING_RULES, NEW_LABELS, target_size=TARGET_SIZE, rm_black_slices=True, file_list=train_files, remap_nn=REMAP_NN)    
-    val_dataset = DatasetDIDC(DATA_FOLDER, GROUPING_RULES, NEW_LABELS, target_size=TARGET_SIZE, rm_black_slices=True, file_list=val_files, remap_nn=REMAP_NN)    
+    train_dataset = LazyDatasetDIDC(DATA_FOLDER, GROUPING_RULES, NEW_LABELS, target_size=TARGET_SIZE, rm_black_slices=True, file_list=train_files, remap_nn=REMAP_NN, threshold_classes=THRESHOLD_CLASSES, min_blob_size=MIN_BLOB_SIZE)    
+    val_dataset = LazyDatasetDIDC(DATA_FOLDER, GROUPING_RULES, NEW_LABELS, target_size=TARGET_SIZE, rm_black_slices=True, file_list=val_files, remap_nn=REMAP_NN, threshold_classes=THRESHOLD_CLASSES, min_blob_size=MIN_BLOB_SIZE)    
 
-    train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    val_dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+    train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
+    val_dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
 
 
     # Training objects instantiation
@@ -357,7 +365,12 @@ def main():
         'target_size': TARGET_SIZE,
         'seed': SEED,
         'parallel': PARALLEL,
-        'device_ids': device_ids
+        'device_ids': device_ids,
+        'threshold_classes': THRESHOLD_CLASSES,
+        'min_blob_size': MIN_BLOB_SIZE,
+        'num_workers': NUM_WORKERS,
+        'pin_memory': PIN_MEMORY,
+        'non_blocking_gpu_loading': NON_BLOCKING_GPU_LOADING
     }
 
     with open(f"{EXP_DIR}/config.json", "w") as f:

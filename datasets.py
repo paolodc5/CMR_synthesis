@@ -7,6 +7,8 @@ import numpy as np
 from scipy.spatial import cKDTree
 from scipy.stats import mode
 from tqdm import tqdm
+import cv2
+import sys
 
 
 class MultiTissueDataset(Dataset):
@@ -65,7 +67,7 @@ class MultiTissueDatasetNoisyBkg(MultiTissueDataset):
 
 class BaseDatasetDIDC(Dataset):
     def __init__(self, data_path, grouping_rules, new_labels, target_size=(384, 384), 
-                 num_input_classes=4, original_labels=None, rm_black_slices=True, remap_nn=False, threshold_classes=50):
+                 num_input_classes=4, original_labels=None, rm_black_slices=True, remap_nn=False, threshold_classes=50, min_blob_size=10):
         
         self.data_path = data_path
         self.grouping_rules = grouping_rules
@@ -75,6 +77,7 @@ class BaseDatasetDIDC(Dataset):
         self.remap_nn = remap_nn
         self.num_input_classes = num_input_classes
         self.threshold_classes = threshold_classes
+        self.min_blob_size = min_blob_size
 
         assert os.path.isdir(self.data_path), f"Path {self.data_path} non esiste."
         assert self.grouping_rules is not None, "Grouping rules mancanti."
@@ -92,15 +95,21 @@ class BaseDatasetDIDC(Dataset):
             fg = TF.resize(fg, self.target_size, interpolation=TF.InterpolationMode.NEAREST)
             mask = TF.resize(mask, self.target_size, interpolation=TF.InterpolationMode.NEAREST)
 
+        protected_indices = [self.original_labels.index(label) for label in ['Background', 'Other_tissue']] # channels untouched in the following steps
+        other_idx = self.original_labels.index("Other_tissue")
+
+        mask_np = mask.numpy()
+        if self.min_blob_size is not None:
+            mask = self.remove_cc(mask=mask_np, min_blob_size=self.min_blob_size, other_idx=self.original_labels.index("Other_tissue"), protected_indices=protected_indices)
+            mask = torch.from_numpy(mask).long()
+
+        if self.threshold_classes is not None:
+            mask = self.filter_underrepresented_classes(mask=mask, min_pixels=self.threshold_classes, other_idx=other_idx, protected_indices=protected_indices)
+
         # NN Remapping of "Other_tissue" pixels to the most common label among their k nearest neighbors that are not "Other_tissue"
         if self.remap_nn:
-            mask_np = mask.numpy()
-            other_idx = self.original_labels.index("Other_tissue")
-            
-            protected_indices = [self.original_labels.index(label) for label in ['Background', 'Other_tissue', 'Heart']] # to avoid remapping of the new labels that are not "Others" (e.g. "Heart_generic") that could be affected by the NN remapping if they are close to "Other_tissue" pixels
-            mask = self.filter_underrepresented_classes(mask=mask, min_pixels=self.threshold_classes, other_idx=other_idx, protected_indices=protected_indices)
-            mask_np = self.remap_NN(mask_np, other_idx)
-            mask = torch.from_numpy(mask_np).long()
+            mask = self.remap_NN(mask.numpy(), other_idx)
+            mask = torch.from_numpy(mask).long()
 
         # LUT remapping of segmentation masks to new labels (only for multi tissue maps)
         mask = self.lut[mask.long()]
@@ -110,12 +119,43 @@ class BaseDatasetDIDC(Dataset):
         fg_one_hot = F.one_hot(fg.long(), num_classes=self.num_input_classes)
         
         # Final permutation in 3D (N, H, W, C) -> (N, C, H, W) or 2D (H, W, C) -> (C, H, W)
-        if fg_one_hot.ndim == 4: # Batch mode
+        if fg_one_hot.ndim == 4:
             fg_one_hot = fg_one_hot.permute(0, 3, 1, 2)
         else:
             fg_one_hot = fg_one_hot.permute(2, 0, 1)
 
         return fg_one_hot.float(), mask
+
+    @staticmethod
+    def remove_cc(mask, min_blob_size, other_idx, protected_indices):
+        """
+        Removes isolated blobs cv2.connectedComponentsWithStats. Takes and returns numpy array. Compatible with both 2D and 3D masks
+        """
+        protected_set = set(protected_indices)
+
+        def process_2d_slice(slice_2d):
+            unique_classes = np.unique(slice_2d)
+            
+            for cls in unique_classes:
+                if cls in protected_set:
+                    continue
+                    
+                bin_mask = (slice_2d == cls).astype(np.uint8)
+                num_labels, labels_map, stats, _ = cv2.connectedComponentsWithStats(bin_mask, connectivity=8)
+                
+                for label_idx in range(1, num_labels):
+                    area = stats[label_idx, cv2.CC_STAT_AREA]
+                    
+                    if area < min_blob_size:
+                        slice_2d[labels_map == label_idx] = other_idx
+
+        # Compatibility handled here
+        if mask.ndim == 3:
+            for i in range(mask.shape[0]):
+                process_2d_slice(mask[i])
+        elif mask.ndim == 2:
+            process_2d_slice(mask)  
+        return mask
 
     @staticmethod
     def check_black_foreground(mask):
@@ -149,7 +189,7 @@ class BaseDatasetDIDC(Dataset):
         Merge the foreground tensor with the segmentation masks tensor (which must be already remapped to the new labels)
         """
         heart_generic_idx = new_labels.index("Heart_generic")
-        others_idx = new_labels.index("Others")
+        others_idx = new_labels.index("Blood_vessels")
 
         fg_mask_boolean = fg_tensor > 0
 
@@ -266,12 +306,12 @@ class RAMDatasetDIDC(BaseDatasetDIDC):
         fg_list = []
         mask_list = []
 
-        for file in tqdm(files):
+        for file in tqdm(files, desc="Loading files into RAM", file=sys.__stderr__):
             if file.endswith('.npy'):
                 try:
                     pat = np.load(os.path.join(self.data_path, file), allow_pickle=True).item()
                     fg = torch.from_numpy(pat['mask_foreground']).permute(2,0,1).long()
-                    mask = torch.from_numpy(pat['interpolated_segmentation']).permute(2,0,1)
+                    mask = torch.from_numpy(np.round(pat['interpolated_segmentation'])).permute(2,0,1).float()
 
                     if self.rm_black_slices:
                         valid = ~self.check_black_foreground(fg)
@@ -303,7 +343,7 @@ class LazyDatasetDIDC(BaseDatasetDIDC):
         print("Lazy Dataset: File...")
         
         self.samples = []
-        for file in files:
+        for file in tqdm(files, desc="Indexing files and slices", file=sys.__stderr__):
             if file.endswith('.npy'):
                 path = os.path.join(self.data_path, file)
                 # For each file load only the non black slice indices (later) if the option is enabled
@@ -333,7 +373,7 @@ class LazyDatasetDIDC(BaseDatasetDIDC):
         
         # Extract slice & Convert to Tensor. Unsqueeze for later compatibility 
         fg = torch.from_numpy(pat['mask_foreground'][:, :, slice_idx]).unsqueeze(0).long()
-        mask = torch.from_numpy(pat['interpolated_segmentation'][:, :, slice_idx]).unsqueeze(0)
+        mask = torch.from_numpy(np.round(pat['interpolated_segmentation'][:, :, slice_idx])).unsqueeze(0).float()
 
         fg_proc, mask_proc = self.process_slice(fg, mask)
 
