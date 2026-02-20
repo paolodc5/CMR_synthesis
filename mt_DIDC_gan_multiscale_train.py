@@ -7,7 +7,7 @@ from itertools import cycle
 from datetime import datetime
 import json
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "2,3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 
 import torch
 from torch.utils.data import DataLoader
@@ -44,11 +44,11 @@ DROPOUT_GEN = 0.3
 NUM_DISCRIMINATORS = 4
 GEN_LR = 1e-4
 DISCR_LR = 1e-5
-PATIENCE_ES = 15 # num * VAL_CHECK_INTERVAL steps with no improvement
+PATIENCE_ES = 25 # num * VAL_CHECK_INTERVAL steps with no improvement
 DELTA_ES = 0.01 # minimum improvement in validation dice loss to reset early stopping counter
 BATCH_SIZE = 16
 VAL_FRACTION = 0.2
-NOTES="Mutliscale gan on DIDC dataset FIXED with new preprocessing, dataset with remapping of 'other_tissue' pixels to their NNs, perceptual loss added and lr as originally"
+NOTES="Mutliscale gan on DIDC dataset FIXED with new preprocessing, now patience is increased to 25"
 PARALLEL = True
 
 LAZY_DATASET = True

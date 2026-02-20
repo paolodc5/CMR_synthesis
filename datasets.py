@@ -6,7 +6,7 @@ import torchvision.transforms.functional as TF
 import numpy as np
 from scipy.spatial import cKDTree
 from scipy.stats import mode
-from tqdm import tqdm
+from tqdm.auto import tqdm
 import cv2
 import sys
 
