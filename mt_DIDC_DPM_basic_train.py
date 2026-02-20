@@ -57,7 +57,7 @@ set_reproducibility(TrainingConfig.seed)
 print(TrainingConfig.seed)
 
 
-def training_step(batch, model, num_classes, optimizer, noise_scheduler, accelerator):
+def train_step(batch, model, num_classes, optimizer, noise_scheduler, accelerator):
     model
     model.train()
 
@@ -106,7 +106,7 @@ def train_loop(config, model, noise_scheduler, optimizer, train_dataloader, lr_s
         progress_bar.set_description(f"Epoch {epoch}")
 
         for step, batch in enumerate(train_dataloader):
-            loss = training_step(batch, model, len(train_dataloader.dataset.new_labels), optimizer, noise_scheduler, accelerator)
+            loss = train_step(batch, model, len(train_dataloader.dataset.new_labels), optimizer, noise_scheduler, accelerator)
 
             progress_bar.update(1)
             logs = {"loss": loss, "lr": lr_scheduler.get_last_lr()[0], "step": global_step}
@@ -126,7 +126,6 @@ def train_loop(config, model, noise_scheduler, optimizer, train_dataloader, lr_s
                 pass
 
 
-
 def main():
     config = TrainingConfig()
     noise_scheduler = DDPMScheduler(num_train_timesteps=1000, beta_schedule="sigmoid")
@@ -141,3 +140,5 @@ def main():
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
     lr_scheduler = get_cosine_schedule_with_warmup(optimizer=optimizer, num_warmup_steps=config.lr_warmup_steps, num_training_steps=(len(train_dataloader) * config.num_epochs))
+
+    train_loop(config, model, noise_scheduler, optimizer, train_dataloader, lr_scheduler)
