@@ -1,8 +1,7 @@
-import matplotlib.pyplot as plt
 import os
 import sys
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"  
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0"  
 
 import torch
 import torch.nn.functional as F
@@ -26,7 +25,7 @@ from utils import set_reproducibility
 
 @dataclass
 class TrainingConfig:
-    run_name: str = "DDPM_test"
+    run_name: str = "DDPM_basic_train"
     data_path: str = "./New_dictionary"
     num_workers: int = 8
     remap_nn: bool = True
@@ -38,18 +37,18 @@ class TrainingConfig:
     rm_black_slices: bool = True
     remap_nn: bool = True
     train_batch_size: int = 16
-    eval_batch_size: int = 8  
-    num_epochs: int = 2
+    eval_batch_size: int = 4  
+    num_epochs: int = 70
     num_train_timesteps: int = 1000
     num_sample_steps: int = 50
-    batch_size_per_gpu: int = 2
+    batch_size_per_gpu: int = 4
     num_gpus: int = torch.cuda.device_count() if torch.cuda.is_available() else 1
     learning_rate: float = 1e-4
-    lr_warmup_steps: int = 500
+    lr_warmup_steps: int = 250
     save_image_epochs: int = 10
-    save_model_epochs: int = 30
+    save_model_epochs: int = 8
     mixed_precision: str = "fp16"  # `no` for float32, `fp16` for automatic mixed precision
-    notes: str = "Diffusion model"
+    notes: str = "Diffusion model first training"
     seed: int = 187
     
     gradient_accumulation_steps: int = 1
@@ -60,13 +59,11 @@ class TrainingConfig:
             1, 
             self.train_batch_size // (self.batch_size_per_gpu * self.num_gpus)
         )
-        
         self.exp_dir = os.path.join(self.exp_dir, f"{datetime.now().strftime('%Y%m%d_%H%M')}_{self.run_name}")
 
-
-def train_step(batch, model, num_classes, optimizer, noise_scheduler, accelerator, lr_scheduler):
-    model
-    model.train()
+def train_val_step(batch, model, num_classes, noise_scheduler, accelerator, lr_scheduler=None, optimizer=None, is_training=True):
+    assert not (is_training and optimizer is None), "Optimizer must be provided for training step"
+    assert not (not is_training and optimizer is not None), "Optimizer should not be provided for validation step"
 
     clean_images = batch['multiClassMask']  # Shape: (B, C, H, W)
     clean_images = F.one_hot(clean_images.long(), num_classes=num_classes).permute(0, 3, 1, 2).float()  # Shape: (B, C, H, W)
@@ -77,16 +74,19 @@ def train_step(batch, model, num_classes, optimizer, noise_scheduler, accelerato
 
     noise = torch.randn_like(clean_images.float())
     noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
-    noise_pred = model(noisy_images, timesteps).sample
-    loss = F.mse_loss(noise_pred, noise)
 
-    with accelerator.accumulate(model):
-        optimizer.zero_grad()
-        accelerator.backward(loss)
-        if accelerator.sync_gradients:
-            accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        lr_scheduler.step()
+    with torch.set_grad_enabled(is_training):
+        noise_pred = model(noisy_images, timesteps).sample
+        loss = F.mse_loss(noise_pred, noise)
+
+    if is_training: 
+        with accelerator.accumulate(model):
+            optimizer.zero_grad()
+            accelerator.backward(loss)
+            if accelerator.sync_gradients:
+                accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            lr_scheduler.step()
 
     return loss.detach().item()
 
@@ -102,10 +102,10 @@ def sample_and_save_images(model, noise_scheduler, config, epoch, num_classes, a
     x = torch.randn(noise_shape, generator=generator, device=accelerator.device)
 
     # Set the noise scheduler timesteps for sampling
-    noise_scheduler.set_timesteps(config.num_sample_steps)
+    noise_scheduler.set_timesteps(config.num_sample_steps, device=accelerator.device)
 
     with torch.no_grad():
-        for t in tqdm(noise_scheduler.timesteps, desc=f"Epoch {epoch} Sampling", leave=False):
+        for t in tqdm(noise_scheduler.timesteps, desc=f"Epoch {epoch} Sampling", leave=False, file=sys.__stderr__):
             noise_pred = model(x, t).sample
             x = noise_scheduler.step(noise_pred, t, x).prev_sample # Standard DDPM step, scheduler subtracts the predicted noise
             
@@ -122,7 +122,7 @@ def sample_and_save_images(model, noise_scheduler, config, epoch, num_classes, a
     scale_factor = 255.0 / (num_classes - 1) if num_classes > 1 else 1.0
     masks_np_visual = (masks_np * scale_factor).astype(np.uint8)
     
-    image_dir = os.path.join(config.output_dir, "logs", "samples")
+    image_dir = os.path.join(config.exp_dir, "samples")
     os.makedirs(image_dir, exist_ok=True)
     
     for i, mask_array in enumerate(masks_np_visual):
@@ -131,7 +131,7 @@ def sample_and_save_images(model, noise_scheduler, config, epoch, num_classes, a
 
     return masks_np
 
-def train_loop(config, model, noise_scheduler, optimizer, train_dataloader, lr_scheduler):
+def train_loop(config, model, noise_scheduler, optimizer, train_dataloader, val_dataloader, lr_scheduler):
     metrics_history = {
         'train_loss': [],
         'val_loss': [],
@@ -151,45 +151,58 @@ def train_loop(config, model, noise_scheduler, optimizer, train_dataloader, lr_s
         accelerator.init_trackers("tb_tracker_train", config=asdict(config))
 
     # Prepare accelerator model
-    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(model, optimizer, train_dataloader, lr_scheduler)
-
+    model, optimizer, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(
+        model, optimizer, train_dataloader, val_dataloader, lr_scheduler
+    )
     global_step = 0
 
     for epoch in range(config.num_epochs):
         progress_bar = tqdm(total=len(train_dataloader), disable=not accelerator.is_local_main_process, file=sys.__stderr__)
         progress_bar.set_description(f"Epoch {epoch}")
 
+        model.train()
+        
+        avg_loss = 0.0
         for step, batch in enumerate(train_dataloader):
-            loss = train_step(batch, model, len(train_dataloader.dataset.new_labels), optimizer, noise_scheduler, accelerator, lr_scheduler)
-
+            loss = train_val_step(batch, model, config.num_input_classes, noise_scheduler=noise_scheduler, accelerator=accelerator, lr_scheduler=lr_scheduler, optimizer=optimizer)
+            avg_loss += loss
             logs = {"loss": loss, "lr": lr_scheduler.get_last_lr()[0], "step": global_step}
             accelerator.log(logs, step=global_step)
-
-            metrics_history['train_loss'].append(loss)
-            metrics_history['lr'].append(lr_scheduler.get_last_lr()[0])
-            metrics_history['current_epoch'] = epoch
 
             progress_bar.set_postfix(**logs)
             progress_bar.update(1)
             global_step += 1
 
+        # save metrics history for this epoch
+        avg_loss /= len(train_dataloader)
+        metrics_history['train_loss'].append(avg_loss)
+        metrics_history['lr'].append(lr_scheduler.get_last_lr()[0])
+        metrics_history['current_epoch'] = epoch
+            
+
         if accelerator.is_main_process:
-            # validation ... (not implemented yet, but placeholder for future validation code)
+            # validation
+            model.eval()
+            
+            val_loss = 0.0
+            for val_batch in val_dataloader:
+                val_loss += train_val_step(val_batch, model, config.num_input_classes, noise_scheduler=noise_scheduler, accelerator=accelerator, is_training=False)
+            val_loss /= len(val_dataloader)
+            metrics_history['val_loss'].append(val_loss)
+            print(f"Epoch {epoch} - Training loss: {avg_loss:.4f}, Validation Loss: {val_loss:.4f}")
+            unwrapped_model = accelerator.unwrap_model(model)
 
             if (epoch + 1) % config.save_image_epochs == 0 or epoch == config.num_epochs - 1:
-                sample_and_save_images(model, noise_scheduler, config, epoch, len(train_dataloader.dataset.new_labels), accelerator)
+                sample_and_save_images(unwrapped_model, noise_scheduler, config, epoch, config.num_input_classes, accelerator)
 
             if (epoch + 1) % config.save_model_epochs == 0 or epoch == config.num_epochs - 1:
-                unwrapped_model = accelerator.unwrap_model(model)
-                checkpoint_path = os.path.join(config.exp_dir, f"checkpoint_epoch_{epoch:04d}")
+                checkpoint_path = os.path.join(config.exp_dir, f"checkpoint_epoch")
                 
                 unwrapped_model.save_pretrained(checkpoint_path)
                 noise_scheduler.save_pretrained(checkpoint_path)
 
                 with open(os.path.join(config.exp_dir, f"metrics_history.json"), "w") as f:
                     json.dump(metrics_history, f, indent=4)
-            
-
 
 def main():
     config = TrainingConfig()
@@ -251,15 +264,14 @@ def main():
 
     noise_scheduler = DDPMScheduler(num_train_timesteps=config.num_train_timesteps, beta_schedule="sigmoid")
     
-    model = UNet2DModel(sample_size=384,  in_channels=22,   out_channels=22, layers_per_block=2,block_out_channels=(128, 256, 512, 512),
+    model = UNet2DModel(sample_size=config.target_size,  in_channels=config.num_input_classes, out_channels=config.num_input_classes, layers_per_block=2, block_out_channels=(128, 256, 512, 512),
         down_block_types=("DownBlock2D", "DownBlock2D", "AttnDownBlock2D", "DownBlock2D"),
         up_block_types=("UpBlock2D", "AttnUpBlock2D", "UpBlock2D", "UpBlock2D"),)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
     lr_scheduler = get_cosine_schedule_with_warmup(optimizer=optimizer, num_warmup_steps=config.lr_warmup_steps, num_training_steps=(len(train_dataloader) * config.num_epochs))
 
-    train_loop(config, model, noise_scheduler, optimizer, train_dataloader, lr_scheduler)
-
+    train_loop(config, model, noise_scheduler, optimizer, train_dataloader, val_dataloader, lr_scheduler)
 
     log_file.close()
 
