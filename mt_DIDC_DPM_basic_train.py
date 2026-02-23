@@ -34,11 +34,17 @@ class TrainingConfig:
     target_size: int = 128
     val_fraction: float = 0.2
     num_input_classes: int = 22
+    num_fg_channels: int = 4
+    unet_layers_per_block: int = 2
+    unet_down_block_types: tuple = ("DownBlock2D", "DownBlock2D", "AttnDownBlock2D", "DownBlock2D")
+    unet_up_block_types: tuple = ("UpBlock2D", "AttnUpBlock2D", "UpBlock2D", "UpBlock2D")
+    unet_blocks_out_channels: tuple = (128, 256, 512, 512)
     rm_black_slices: bool = True
     remap_nn: bool = True
     train_batch_size: int = 16
     eval_batch_size: int = 4  
     num_epochs: int = 70
+    conditional_generation: bool = True
     num_train_timesteps: int = 1000
     num_sample_steps: int = 50
     batch_size_per_gpu: int = 4
@@ -60,14 +66,18 @@ class TrainingConfig:
             self.train_batch_size // (self.batch_size_per_gpu * self.num_gpus)
         )
         self.exp_dir = os.path.join(self.exp_dir, f"{datetime.now().strftime('%Y%m%d_%H%M')}_{self.run_name}")
+        self.fg_channels = self.num_fg_channels if self.conditional_generation else 0
 
-def train_val_step(batch, model, num_classes, noise_scheduler, accelerator, lr_scheduler=None, optimizer=None, is_training=True):
+def train_val_step(batch, model, num_classes, noise_scheduler, accelerator, lr_scheduler=None, optimizer=None, is_training=True, conditional_generation=False):
     assert not (is_training and optimizer is None), "Optimizer must be provided for training step"
     assert not (not is_training and optimizer is not None), "Optimizer should not be provided for validation step"
 
     clean_images = batch['multiClassMask']  # Shape: (B, C, H, W)
+    fg_masks = batch['input_label'] 
+
     clean_images = F.one_hot(clean_images.long(), num_classes=num_classes).permute(0, 3, 1, 2).float()  # Shape: (B, C, H, W)
     clean_images = clean_images * 2.0 - 1.0  # Scale to [-1, 1]
+    fg_masks = fg_masks.float() * 2.0 - 1.0 
 
     batch_size = clean_images.size(0)
     timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (batch_size,), device=accelerator.device).long()
@@ -75,8 +85,13 @@ def train_val_step(batch, model, num_classes, noise_scheduler, accelerator, lr_s
     noise = torch.randn_like(clean_images.float())
     noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
 
+    if conditional_generation:
+        net_input = torch.cat([noisy_images, fg_masks], dim=1)
+    else:
+        net_input = noisy_images
+
     with torch.set_grad_enabled(is_training):
-        noise_pred = model(noisy_images, timesteps).sample
+        noise_pred = model(net_input, timesteps).sample
         loss = F.mse_loss(noise_pred, noise)
 
     if is_training: 
@@ -90,14 +105,18 @@ def train_val_step(batch, model, num_classes, noise_scheduler, accelerator, lr_s
 
     return loss.detach().item()
 
-def sample_and_save_images(model, noise_scheduler, config, epoch, num_classes, accelerator):
+def sample_and_save_images(model, noise_scheduler, config, epoch, num_classes, accelerator, val_batch):
     """
     Generates images from pure noise.
     """
     model.eval()
 
+    # foreground
+    fg_masks = val_batch['input_label'].float() * 2.0 - 1.0
+    actual_batch_size = config.batch_size_per_gpu
+
     # Generate noise tensor 
-    noise_shape = (config.eval_batch_size, num_classes, config.target_size, config.target_size)
+    noise_shape = (actual_batch_size, num_classes, config.target_size, config.target_size)
     generator = torch.Generator(device=accelerator.device).manual_seed(config.seed)
     x = torch.randn(noise_shape, generator=generator, device=accelerator.device)
 
@@ -106,9 +125,10 @@ def sample_and_save_images(model, noise_scheduler, config, epoch, num_classes, a
 
     with torch.no_grad():
         for t in tqdm(noise_scheduler.timesteps, desc=f"Epoch {epoch} Sampling", leave=False, file=sys.__stderr__):
-            noise_pred = model(x, t).sample
+            net_input = torch.cat([x, fg_masks], dim=1) if config.conditional_generation else x # conditional generation input if enabled
+            noise_pred = model(net_input, t).sample
             x = noise_scheduler.step(noise_pred, t, x).prev_sample # Standard DDPM step, scheduler subtracts the predicted noise
-            
+
     x_classes = torch.argmax(x, dim=1) # Shape becomes (Batch, H, W)
 
     # Save images to TensorBoard
@@ -154,8 +174,10 @@ def train_loop(config, model, noise_scheduler, optimizer, train_dataloader, val_
     model, optimizer, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(
         model, optimizer, train_dataloader, val_dataloader, lr_scheduler
     )
-    global_step = 0
 
+    fixed_sample_batch = next(iter(val_dataloader))
+
+    global_step = 0
     for epoch in range(config.num_epochs):
         progress_bar = tqdm(total=len(train_dataloader), disable=not accelerator.is_local_main_process, file=sys.__stderr__)
         progress_bar.set_description(f"Epoch {epoch}")
@@ -164,7 +186,17 @@ def train_loop(config, model, noise_scheduler, optimizer, train_dataloader, val_
         
         avg_loss = 0.0
         for step, batch in enumerate(train_dataloader):
-            loss = train_val_step(batch, model, config.num_input_classes, noise_scheduler=noise_scheduler, accelerator=accelerator, lr_scheduler=lr_scheduler, optimizer=optimizer)
+            loss = train_val_step(batch, 
+                                  model, 
+                                  config.num_input_classes, 
+                                  noise_scheduler=noise_scheduler, 
+                                  accelerator=accelerator, 
+                                  lr_scheduler=lr_scheduler, 
+                                  optimizer=optimizer, 
+                                  conditional_generation=config.conditional_generation, 
+                                  is_training=True
+                                  )
+            # WARNING: to be fixed, logging every epoch instead of every step, otherwise it becomes too verbose !!!!!!!!!!!!!!!
             avg_loss += loss
             logs = {"loss": loss, "lr": lr_scheduler.get_last_lr()[0], "step": global_step}
             accelerator.log(logs, step=global_step)
@@ -186,14 +218,21 @@ def train_loop(config, model, noise_scheduler, optimizer, train_dataloader, val_
             
             val_loss = 0.0
             for val_batch in val_dataloader:
-                val_loss += train_val_step(val_batch, model, config.num_input_classes, noise_scheduler=noise_scheduler, accelerator=accelerator, is_training=False)
+                val_loss += train_val_step(val_batch, 
+                                           model, 
+                                           config.num_input_classes, 
+                                           noise_scheduler=noise_scheduler, 
+                                           accelerator=accelerator, 
+                                           conditional_generation=config.conditional_generation, 
+                                           is_training=False
+                                           )
             val_loss /= len(val_dataloader)
             metrics_history['val_loss'].append(val_loss)
             print(f"Epoch {epoch} - Training loss: {avg_loss:.4f}, Validation Loss: {val_loss:.4f}")
             unwrapped_model = accelerator.unwrap_model(model)
 
             if (epoch + 1) % config.save_image_epochs == 0 or epoch == config.num_epochs - 1:
-                sample_and_save_images(unwrapped_model, noise_scheduler, config, epoch, config.num_input_classes, accelerator)
+                sample_and_save_images(unwrapped_model, noise_scheduler, config, epoch, config.num_input_classes, accelerator, fixed_sample_batch)
 
             if (epoch + 1) % config.save_model_epochs == 0 or epoch == config.num_epochs - 1:
                 checkpoint_path = os.path.join(config.exp_dir, f"checkpoint_epoch")
@@ -258,15 +297,21 @@ def main():
                                    file_list=val_files)
     
     train_dataloader = DataLoader(train_dataset, batch_size=config.batch_size_per_gpu, shuffle=True, num_workers=config.num_workers)
-    val_dataloader = DataLoader(val_dataset, batch_size=config.batch_size_per_gpu, shuffle=True, num_workers=config.num_workers)
+    val_dataloader = DataLoader(val_dataset, batch_size=config.batch_size_per_gpu, shuffle=False, num_workers=config.num_workers)
 
 
 
     noise_scheduler = DDPMScheduler(num_train_timesteps=config.num_train_timesteps, beta_schedule="sigmoid")
     
-    model = UNet2DModel(sample_size=config.target_size,  in_channels=config.num_input_classes, out_channels=config.num_input_classes, layers_per_block=2, block_out_channels=(128, 256, 512, 512),
-        down_block_types=("DownBlock2D", "DownBlock2D", "AttnDownBlock2D", "DownBlock2D"),
-        up_block_types=("UpBlock2D", "AttnUpBlock2D", "UpBlock2D", "UpBlock2D"),)
+    in_channels = config.num_input_classes + config.num_fg_channels if config.conditional_generation else config.num_input_classes
+    model = UNet2DModel(sample_size=config.target_size,  
+                        in_channels=in_channels, 
+                        out_channels=config.num_input_classes, 
+                        layers_per_block=config.unet_layers_per_block, 
+                        block_out_channels=config.unet_blocks_out_channels,
+                        down_block_types=config.unet_down_block_types,
+                        up_block_types=config.unet_up_block_types
+                        )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
     lr_scheduler = get_cosine_schedule_with_warmup(optimizer=optimizer, num_warmup_steps=config.lr_warmup_steps, num_training_steps=(len(train_dataloader) * config.num_epochs))
