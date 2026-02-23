@@ -162,3 +162,12 @@ def set_reproducibility(seed=42):
     
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+def sanitize_config(config_dict):
+    """Converts non-serializable objects in a config dictionary to strings for logging."""
+    sanitized_config = {}
+    for key, value in config_dict.items():
+        if isinstance(value, (tuple, list, dict)):
+            sanitized_config[key] = str(value) 
+        else:
+            sanitized_config[key] = value

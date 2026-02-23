@@ -20,12 +20,12 @@ from PIL import Image
 from diffusers import DDPMScheduler, UNet2DModel, get_cosine_schedule_with_warmup
 from datasets import LazyDatasetDIDC
 from mt_DIDC_config import GROUPING_RULES, NEW_LABELS
-from utils import set_reproducibility
+from utils import set_reproducibility, sanitize_config
 
 
 @dataclass
 class TrainingConfig:
-    run_name: str = "DDPM_basic_train"
+    run_name: str = "DDPM_conditional_train"
     data_path: str = "./New_dictionary"
     num_workers: int = 8
     remap_nn: bool = True
@@ -54,7 +54,7 @@ class TrainingConfig:
     save_image_epochs: int = 10
     save_model_epochs: int = 8
     mixed_precision: str = "fp16"  # `no` for float32, `fp16` for automatic mixed precision
-    notes: str = "Diffusion model first training"
+    notes: str = "Diffusion model first CONDITIONAL training"
     seed: int = 187
     
     gradient_accumulation_steps: int = 1
@@ -165,10 +165,11 @@ def train_loop(config, model, noise_scheduler, optimizer, train_dataloader, val_
         project_dir=os.path.join(config.exp_dir),
     )
 
+    config_dict = asdict(config)
     if accelerator.is_main_process:
         if config.exp_dir is not None:
             os.makedirs(config.exp_dir, exist_ok=True)
-        accelerator.init_trackers("tb_tracker_train", config=asdict(config))
+        accelerator.init_trackers("tb_tracker_train", config=sanitize_config(config_dict))
 
     # Prepare accelerator model
     model, optimizer, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(
@@ -278,7 +279,7 @@ def main():
                                     GROUPING_RULES, 
                                     NEW_LABELS, 
                                     target_size=(config.target_size, config.target_size), 
-                                    num_input_classes=config.num_input_classes, 
+                                    num_input_classes=config.num_fg_channels, 
                                     rm_black_slices=config.rm_black_slices, 
                                     remap_nn=config.remap_nn, 
                                     threshold_classes=config.threshold_classes, 
@@ -289,7 +290,7 @@ def main():
                                    GROUPING_RULES, 
                                    NEW_LABELS, 
                                    target_size=(config.target_size, config.target_size), 
-                                   num_input_classes=config.num_input_classes, 
+                                   num_input_classes=config.num_fg_channels, 
                                    rm_black_slices=config.rm_black_slices, 
                                    remap_nn=config.remap_nn, 
                                    threshold_classes=config.threshold_classes, 
