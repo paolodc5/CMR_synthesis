@@ -20,7 +20,7 @@ from PIL import Image
 from diffusers import DDPMScheduler, UNet2DModel, get_cosine_schedule_with_warmup
 from datasets import LazyDatasetDIDC
 from mt_DIDC_config import GROUPING_RULES, NEW_LABELS
-from utils import set_reproducibility, sanitize_config
+from utils import set_reproducibility, sanitize_config, multiclass_dice_loss
 
 
 @dataclass
@@ -43,7 +43,7 @@ class TrainingConfig:
     remap_nn: bool = True
     train_batch_size: int = 16
     eval_batch_size: int = 4  
-    num_epochs: int = 70
+    num_epochs: int = 170
     conditional_generation: bool = True
     num_train_timesteps: int = 1000
     num_sample_steps: int = 50
@@ -54,7 +54,7 @@ class TrainingConfig:
     save_image_epochs: int = 10
     save_model_epochs: int = 8
     mixed_precision: str = "fp16"  # `no` for float32, `fp16` for automatic mixed precision
-    notes: str = "Diffusion model first CONDITIONAL training"
+    notes: str = "Diffusion model first CONDITIONAL training more epochs, logging dice loss on generated samples"
     seed: int = 187
     
     gradient_accumulation_steps: int = 1
@@ -129,6 +129,9 @@ def sample_and_save_images(model, noise_scheduler, config, epoch, num_classes, a
             noise_pred = model(net_input, t).sample
             x = noise_scheduler.step(noise_pred, t, x).prev_sample # Standard DDPM step, scheduler subtracts the predicted noise
 
+    dice_loss = multiclass_dice_loss(x, val_batch['multiClassMask'].long())
+    print(f"Epoch {epoch} - Sample Dice Loss: {dice_loss:.4f}")
+
     x_classes = torch.argmax(x, dim=1) # Shape becomes (Batch, H, W)
 
     # Save images to TensorBoard
@@ -149,12 +152,13 @@ def sample_and_save_images(model, noise_scheduler, config, epoch, num_classes, a
         img = Image.fromarray(mask_array, mode="L")
         img.save(os.path.join(image_dir, f"epoch_{epoch:04d}_sample_{i:02d}.png"))
 
-    return masks_np
+    return masks_np, dice_loss
 
 def train_loop(config, model, noise_scheduler, optimizer, train_dataloader, val_dataloader, lr_scheduler):
     metrics_history = {
         'train_loss': [],
         'val_loss': [],
+        'sample_dice_loss': [],
         'lr': [],
     }
     
@@ -229,12 +233,17 @@ def train_loop(config, model, noise_scheduler, optimizer, train_dataloader, val_
                                            )
             val_loss /= len(val_dataloader)
             metrics_history['val_loss'].append(val_loss)
+            accelerator.log({"val_loss": val_loss}, step=global_step)
             print(f"Epoch {epoch} - Training loss: {avg_loss:.4f}, Validation Loss: {val_loss:.4f}")
             unwrapped_model = accelerator.unwrap_model(model)
 
+            # Sample and save images every few epochs
             if (epoch + 1) % config.save_image_epochs == 0 or epoch == config.num_epochs - 1:
-                sample_and_save_images(unwrapped_model, noise_scheduler, config, epoch, config.num_input_classes, accelerator, fixed_sample_batch)
+                _, dice_loss = sample_and_save_images(unwrapped_model, noise_scheduler, config, epoch, config.num_input_classes, accelerator, fixed_sample_batch)
+                metrics_history['sample_dice_loss'].append(dice_loss)
+                accelerator.log({"sample_dice_loss": dice_loss}, step=global_step)
 
+            # Save model checkpoint every few epochs
             if (epoch + 1) % config.save_model_epochs == 0 or epoch == config.num_epochs - 1:
                 checkpoint_path = os.path.join(config.exp_dir, f"checkpoint_epoch")
                 

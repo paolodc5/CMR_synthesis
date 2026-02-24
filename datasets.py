@@ -311,10 +311,12 @@ class RAMDatasetDIDC(BaseDatasetDIDC):
                 try:
                     pat = np.load(os.path.join(self.data_path, file), allow_pickle=True).item()
                     fg = torch.from_numpy(pat['mask_foreground']).permute(2,0,1).long()
-                    mask = torch.from_numpy(np.round(pat['interpolated_segmentation']))
+                    if len(torch.unique(fg)) > 3:
+                        fg[fg > 3] = 0 # remove noisy labels in the foreground mask
+                    mask = np.round(pat['interpolated_segmentation'])
                     if mask.ndim == 1:
-                        mask = mask.reshape(fg.shape[0], fg.shape[1], -1, order='F')
-                    mask = mask.permute(2,0,1).float()
+                        mask = mask.reshape(fg.shape[0], fg.shape[1], -1, order='F') # account for shape errors in the dataset
+                    mask = torch.from_numpy(mask).permute(2,0,1).float()
 
                     if self.rm_black_slices:
                         valid = ~self.check_black_foreground(fg)
@@ -376,11 +378,13 @@ class LazyDatasetDIDC(BaseDatasetDIDC):
         
         # Extract slice & Convert to Tensor. Unsqueeze for later compatibility 
         fg = torch.from_numpy(pat['mask_foreground'][:, :, slice_idx]).unsqueeze(0).long()
+        if len(torch.unique(fg)) > 3:
+            fg[fg > 3] = 0 # remove noisy labels in the foreground mask
+
         mask = pat['interpolated_segmentation']
         if mask.ndim == 1:
-            mask = mask.reshape(fg.shape[1], fg.shape[2], -1, order='F')
-        mask = torch.from_numpy(np.round(mask[:, :, slice_idx]))
-        mask = mask.unsqueeze(0).float()
+            mask = mask.reshape(fg.shape[1], fg.shape[2], -1, order='F') # Reshape if there are errors in the dataset
+        mask = torch.from_numpy(np.round(mask[:, :, slice_idx])).unsqueeze(0).float()
 
         fg_proc, mask_proc = self.process_slice(fg, mask)
 

@@ -7,7 +7,7 @@ from itertools import cycle
 from datetime import datetime
 import json
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 import torch
 from torch.utils.data import DataLoader
@@ -23,7 +23,7 @@ from train_utils import EarlyStopping, save_checkpoint
 from mt_DIDC_config import GROUPING_RULES, NEW_LABELS
 
 
-DATA_FOLDER = "./New_dictionary"
+DATA_FOLDER = "./DIDC_multiclass_coro_v2"
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 SEED = 187
@@ -48,7 +48,7 @@ PATIENCE_ES = 25 # num * VAL_CHECK_INTERVAL steps with no improvement
 DELTA_ES = 0.01 # minimum improvement in validation dice loss to reset early stopping counter
 BATCH_SIZE = 16
 VAL_FRACTION = 0.2
-NOTES="Mutliscale gan on DIDC dataset FIXED with new preprocessing, now patience is increased to 25"
+NOTES="Mutliscale gan on corov2 DIDC dataset hyperparams are set from last training"
 PARALLEL = True
 
 LAZY_DATASET = True
