@@ -47,7 +47,7 @@ class TrainingConfig:
     conditional_generation: bool = True
     num_train_timesteps: int = 1000
     num_sample_steps: int = 50
-    batch_size_per_gpu: int = 4
+    batch_size_per_gpu: int = 8
     num_gpus: int = torch.cuda.device_count() if torch.cuda.is_available() else 1
     learning_rate: float = 1e-4
     lr_warmup_steps: int = 250
@@ -130,6 +130,7 @@ def sample_and_save_images(model, noise_scheduler, config, epoch, num_classes, a
             x = noise_scheduler.step(noise_pred, t, x).prev_sample # Standard DDPM step, scheduler subtracts the predicted noise
 
     dice_loss = multiclass_dice_loss(x, val_batch['multiClassMask'].long())
+    if isinstance(dice_loss, torch.Tensor): dice_loss = dice_loss.item()
     print(f"Epoch {epoch} - Sample Dice Loss: {dice_loss:.4f}")
 
     x_classes = torch.argmax(x, dim=1) # Shape becomes (Batch, H, W)

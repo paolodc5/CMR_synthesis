@@ -46,9 +46,9 @@ GEN_LR = 1e-4
 DISCR_LR = 1e-5
 PATIENCE_ES = 25 # num * VAL_CHECK_INTERVAL steps with no improvement
 DELTA_ES = 0.01 # minimum improvement in validation dice loss to reset early stopping counter
-BATCH_SIZE = 16
+BATCH_SIZE = 8
 VAL_FRACTION = 0.2
-NOTES="Mutliscale gan on corov2 DIDC dataset hyperparams are set from last training"
+NOTES="Mutliscale gan on corov2 DIDC dataset hyperparams are set from last training, dimished batch size for single GPU training"
 PARALLEL = True
 
 LAZY_DATASET = True

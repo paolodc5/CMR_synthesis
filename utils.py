@@ -171,3 +171,11 @@ def sanitize_config(config_dict):
             sanitized_config[key] = str(value) 
         else:
             sanitized_config[key] = value
+
+
+if __name__ == "__main__":
+    # test multiclass_dice_loss with dummy data
+    pred = torch.tensor([[[[0.1, 0.2], [0.3, 0.4]], [[0.5, 0.6], [0.7, 0.8]]]])  # Shape (1, 2, 2, 2)
+    target = torch.tensor([[[0, 1], [1, 0]]])  # Shape (1, 2, 2)
+    loss = multiclass_dice_loss(pred, target)
+    print(f"Dice Loss: {loss.item():.4f}")
