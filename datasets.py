@@ -378,7 +378,7 @@ class LazyDatasetDIDC(BaseDatasetDIDC):
         
         # Extract slice & Convert to Tensor. Unsqueeze for later compatibility 
         fg = torch.from_numpy(pat['mask_foreground'][:, :, slice_idx]).unsqueeze(0).long()
-        fg[fg > 3] = 0 # remove noisy labels in the foreground mask
+        fg[(fg > 3) | (fg < 0)] = 0 # remove noisy labels in the foreground mask
 
         mask = pat['interpolated_segmentation']
         if mask.ndim == 1:
