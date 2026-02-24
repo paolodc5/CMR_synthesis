@@ -29,6 +29,7 @@ class VAETrainingConfig:
     remap_nn: bool = True
     train_batch_size: int = 16
     eval_batch_size: int = 4  
+    batch_size_per_gpu: int = 2
     num_epochs: int = 170
     
     latent_channels: int = 4 # Compresses the input mask (22 channels) into a 4-channel latent space (bottleneck)
@@ -42,7 +43,7 @@ class VAETrainingConfig:
     threshold_classes: int = 50
     min_blob_size: int = 10
 
-    batch_size_per_gpu: int = 4
+    
     num_gpus: int = torch.cuda.device_count() if torch.cuda.is_available() else 1
     learning_rate: float = 1e-4
     lr_warmup_steps: int = 250
