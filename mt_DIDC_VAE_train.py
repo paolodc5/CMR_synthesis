@@ -20,14 +20,14 @@ from utils import multiclass_dice_loss, set_reproducibility, sanitize_config, sa
 @dataclass
 class VAETrainingConfig:
     run_name: str = "VAE_KL_train"
-    data_path: str = "./DIDC_multiclass_coro_v2"
+    data_path: str = "./DIDC_multiclass_coro_v2_prep_old"
     num_workers: int = 8
     target_size: int = 384
     val_fraction: float = 0.2
     num_input_classes: int = 22
     train_batch_size: int = 16
     eval_batch_size: int = 4  
-    batch_size_per_gpu: int = 2
+    batch_size_per_gpu: int = 4
     num_epochs: int = 170
     
     latent_channels: int = 4 # Compresses the input mask (22 channels) into a 4-channel latent space (bottleneck)
@@ -56,8 +56,10 @@ class VAETrainingConfig:
 
 def train_val_step(batch, model, num_classes, accelerator, optimizer=None, lr_scheduler=None, is_training=True, kl_weight=1e-5):
     assert not (is_training and optimizer is None), "Optimizer must be provided for training step"
-    
+
     target_classes = batch['multiClassMask'].long() # Shape: (B, H, W)
+    if target_classes.dim() == 4:
+        target_classes = target_classes.squeeze(1)
 
     clean_images = F.one_hot(target_classes, num_classes=num_classes).permute(0, 3, 1, 2).float() 
     clean_images = clean_images * 2.0 - 1.0 
@@ -91,6 +93,8 @@ def sample_and_save_reconstructions(model, config, epoch, num_classes, accelerat
     model.eval()
     
     gt_classes = val_batch['multiClassMask'].long()
+    if gt_classes.dim() == 4:
+        gt_classes = gt_classes.squeeze(1)
     
     clean_images_oh = F.one_hot(gt_classes, num_classes=num_classes).permute(0, 3, 1, 2).float() 
     clean_images_oh = (clean_images_oh * 2.0 - 1.0).to(accelerator.device)
@@ -240,7 +244,7 @@ def main():
     else:
         raise FileNotFoundError(f"Dataset configuration file not found at {dataset_config_path}. Please run the dataset preprocessing script first.")
 
-
+    all_files = sorted([f for f in os.listdir(config.data_path) if f.endswith('.npy')])
     all_files = sorted(list(set([
         f.replace('_fg.npy', '').replace('_mask.npy', '') 
         for f in all_files if f.endswith('.npy')
@@ -263,7 +267,7 @@ def main():
         }, f, indent=4)
 
     with open (f"{config.exp_dir}/training_config.json", "w") as f:
-        json.dump({**sanitize_config(asdict(config)), **sanitize_config(config)}, f, indent=4)
+        json.dump({**sanitize_config(asdict(config)), **sanitize_config(dataset_config)}, f, indent=4)
 
     train_dataset = FastDatasetDIDC(config.data_path, file_list=train_files)
     val_dataset =  FastDatasetDIDC(config.data_path, file_list=val_files)
@@ -284,7 +288,7 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
     lr_scheduler = get_cosine_schedule_with_warmup(optimizer=optimizer, num_warmup_steps=config.lr_warmup_steps, num_training_steps=(len(train_dataloader) * config.num_epochs))
 
-    # train_loop(config, model, optimizer, train_dataloader, val_dataloader, lr_scheduler)
+    train_loop(config, model, optimizer, train_dataloader, val_dataloader, lr_scheduler)
 
     log_file.close()
 

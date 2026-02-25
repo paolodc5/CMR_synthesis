@@ -167,10 +167,12 @@ def sanitize_config(config_dict):
     """Converts non-serializable objects in a config dictionary to strings for logging."""
     sanitized_config = {}
     for key, value in config_dict.items():
-        if isinstance(value, (tuple, list, dict)):
+        if isinstance(value, (tuple, list, dict, type(None))):
             sanitized_config[key] = str(value) 
         else:
             sanitized_config[key] = value
+
+    return sanitized_config
 
 
 if __name__ == "__main__":

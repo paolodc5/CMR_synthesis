@@ -7,26 +7,22 @@ from itertools import cycle
 from datetime import datetime
 import json
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 import torch
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
 from torch import device, nn, optim
 
-from utils import (load_all_data, 
-                   squeeze_and_concat, 
-                   filter_mask_keep_labels, 
-                   multiclass_dice_loss,
-                   set_reproducibility)
-from datasets import LazyDatasetDIDC
+from utils import  multiclass_dice_loss, set_reproducibility, sanitize_config
+from datasets import FastDatasetDIDC
 from unet_advanced import UNetAdvanced as UNetGan
 from gan_basic import DiscriminatorModel
 from train_utils import EarlyStopping, save_checkpoint
 from mt_DIDC_config import GROUPING_RULES, NEW_LABELS
 
 
-DATA_FOLDER = "./DIDC_multiclass_coro_v2"
+DATA_FOLDER = "./DIDC_multiclass_coro_v2_prep_old"
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 SEED = 187
@@ -53,15 +49,18 @@ PATIENCE_ES = 15 # num * VAL_CHECK_INTERVAL steps with no improvement
 DELTA_ES = 0.01 # minimum improvement in validation dice loss to reset early stopping counter
 BATCH_SIZE = 8
 NOTES="Basic GAN training on DIDC COROV2 data (benchmark), no remapping of labels, no blob size filtering, no thresholding."
+NUM_WORKERS = 8
 PARALLEL = False
-REMAP_NN = False # Whether to remap non-numerical labels to numerical ones (0-11)
-MIN_BLOB_SIZE = None # Minimum blob size in pixels to keep in the segmentation masks (after remapping)
-THRESHOLD_CLASSES = None # Classes for which to apply thresholding based on blob size (after remapping)
 
 
 def train_discriminator(batch, gen, discr, criterion_GAN, optim_discr, device='cpu'):
     input = batch['input_label'].to(device) # Models passed to the function should be already on the same device
     gt = batch['multiClassMask'].to(device)
+
+    if input.dim() == 5:
+        input = input.squeeze(1) # Remove the redundant channel dimension if it exists (B, 1, C, H, W) -> (B, C, H, W)
+    if gt.dim() == 4:
+        gt = gt.squeeze(1) # Remove the redundant channel dimension if it exists (B, 1, H, W) -> (B, H, W)
 
     # train discriminator
     with torch.no_grad():
@@ -88,6 +87,11 @@ def train_generator(batch, gen, discr, criterion_GAN, criterion_CE, optim_gen, l
     input = batch['input_label'].to(device)
     gt = batch['multiClassMask'].to(device)
     
+    if input.dim() == 5:
+        input = input.squeeze(1) # Remove the redundant channel dimension if it exists (B, 1, C, H, W) -> (B, C, H, W)
+    if gt.dim() == 4:
+        gt = gt.squeeze(1) # Remove the redundant channel dimension if it exists (B, 1, H, W) -> (B, H, W)
+
     gen_img = gen(input)
     gen_img_probs = gen_img.softmax(dim=1)  # Now with gradients enablesd for generator training
 
@@ -117,6 +121,11 @@ def validate_generator(val_dataloader, gen, discr, criterion_GAN, criterion_CE, 
         for batch in val_dataloader:
             input = batch['input_label'].to(device)
             gt = batch['multiClassMask'].to(device)
+            
+            if input.dim() == 5:
+                input = input.squeeze(1) # Remove the redundant channel dimension if it exists (B, 1, C, H, W) -> (B, C, H, W)
+            if gt.dim() == 4:
+                gt = gt.squeeze(1) # Remove the redundant channel dimension if it exists (B, 1, H, W) -> (B, H, W)
 
             gen_img = gen(input)
             gen_img_probs = gen_img.softmax(dim=1)
@@ -234,8 +243,20 @@ def main():
     print(f'Num available GPUs: ', torch.cuda.device_count())
     print(f"Device: {p.name} (Memory: {p.total_memory / 1e9:.2f} GB)")
 
+    dataset_config_path = os.path.join(DATA_FOLDER, "dataset_config.json")
+    if os.path.exists(dataset_config_path):
+        with open(dataset_config_path, "r") as f:
+            dataset_config = json.load(f)
+        print("Dataset configuration loaded successfully")
+    else:
+        raise FileNotFoundError(f"Dataset configuration file not found at {dataset_config_path}. Please run the dataset preprocessing script first.")
+
     # Dataset
     all_files = sorted([f for f in os.listdir(DATA_FOLDER) if f.endswith('.npy')])
+    all_files = sorted(list(set([
+        f.replace('_fg.npy', '').replace('_mask.npy', '') 
+        for f in all_files if f.endswith('.npy')
+    ]))) # compatible with all datatset versions, just extract the unique patient IDs from the file names
     train_files, val_files = train_test_split(all_files, test_size=VAL_FRACTION, random_state=SEED)
 
     ### Save train-val split indices for reproducibility, split is made patient-wise
@@ -248,20 +269,19 @@ def main():
     
     with open (f"{EXP_DIR}/grouping_rules_and_labels.json", "w") as f:
         json.dump({
-            'grouping_rules': GROUPING_RULES,
-            'new_labels': NEW_LABELS
+            'grouping_rules': dataset_config.get('grouping_rules_used'),
+            'new_labels': dataset_config.get('new_labels_used')
         }, f, indent=4)
 
-    train_dataset = LazyDatasetDIDC(DATA_FOLDER, GROUPING_RULES, NEW_LABELS, target_size=TARGET_SIZE, rm_black_slices=True, file_list=train_files, remap_nn=REMAP_NN, threshold_classes=THRESHOLD_CLASSES, min_blob_size=MIN_BLOB_SIZE)    
-    val_dataset = LazyDatasetDIDC(DATA_FOLDER, GROUPING_RULES, NEW_LABELS, target_size=TARGET_SIZE, rm_black_slices=True, file_list=val_files, remap_nn=REMAP_NN, threshold_classes=THRESHOLD_CLASSES, min_blob_size=MIN_BLOB_SIZE)    
-
-    train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    val_dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
-
+    train_dataset = FastDatasetDIDC(DATA_FOLDER, file_list=train_files)
+    val_dataset =  FastDatasetDIDC(DATA_FOLDER, file_list=val_files)
+    
+    train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
+    val_dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
 
     # Training objects instantiation
     n_input_classes = 4
-    n_output_classes = len(train_dataset.new_labels)
+    n_output_classes = len(dataset_config.get('new_labels_used'))
     gen = UNetGan(in_ch=n_input_classes, num_classes=n_output_classes, dropout_p=DROPOUT_GEN).to(DEVICE)
     discr = DiscriminatorModel(in_ch=n_input_classes+n_output_classes, base_ch=64).to(DEVICE)
 
@@ -302,7 +322,7 @@ def main():
     }
 
     with open(f"{EXP_DIR}/config.json", "w") as f:
-        json.dump(config, f, indent=4)
+        json.dump({**config, **sanitize_config(dataset_config)}, f, indent=4)
     
     # training loop
     history = train_gan(NUM_STEPS, 

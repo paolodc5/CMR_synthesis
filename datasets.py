@@ -608,3 +608,12 @@ class FastDatasetDIDC(DatasetDIDC):
         return {'input_label': fg_tensor, 'multiClassMask': mask_tensor}
 
 
+if __name__ == "__main__":
+    # test FastDatasetDIDC
+    data_path = "DIDC_multiclass_coro_v2_prep"
+    dataset = FastDatasetDIDC(data_path)
+    print(f"Dataset length: {len(dataset)}")
+    sample = dataset[0]
+    print(f"Sample keys: {sample.keys()}")
+    print(f"Input label shape: {sample['input_label'].shape}, dtype: {sample['input_label'].dtype}")
+    print(f"Multi-class mask shape: {sample['multiClassMask'].shape}, dtype: {sample['multiClassMask'].dtype}")
