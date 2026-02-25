@@ -20,7 +20,7 @@ from utils import multiclass_dice_loss, set_reproducibility, sanitize_config, sa
 @dataclass
 class VAETrainingConfig:
     run_name: str = "VAE_KL_train"
-    data_path: str = "./New_dictionary"
+    data_path: str = "./DIDC_multiclass_coro_v2"
     num_workers: int = 8
     target_size: int = 384
     val_fraction: float = 0.2
@@ -51,7 +51,7 @@ class VAETrainingConfig:
     save_model_epochs: int = 8
     mixed_precision: str = "fp16"
     seed: int = 187
-    notes: str = "VAE with KL divergence loss, Targeting 4 foreground classes with remapping and thresholding."
+    notes: str = "VAE with KL divergence loss, Targeting 4 foreground classes with remapping and thresholding. NEW dataset coroV2"
     gradient_accumulation_steps: int = 1
     exp_dir = './experiments/DIDC_VAE' 
 

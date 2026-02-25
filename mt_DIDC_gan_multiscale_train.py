@@ -370,7 +370,8 @@ def main():
         'min_blob_size': MIN_BLOB_SIZE,
         'num_workers': NUM_WORKERS,
         'pin_memory': PIN_MEMORY,
-        'non_blocking_gpu_loading': NON_BLOCKING_GPU_LOADING
+        'non_blocking_gpu_loading': NON_BLOCKING_GPU_LOADING,
+        'data_folder': DATA_FOLDER,
     }
 
     with open(f"{EXP_DIR}/config.json", "w") as f:
