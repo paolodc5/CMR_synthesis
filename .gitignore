@@ -5,6 +5,7 @@ experiments/
 old/
 .venv/
 __pycache__/
+DIDC_multiclass_coro_v2_prep
 
 .DS_Store
 

@@ -532,7 +532,6 @@ class DatasetDIDC(Dataset):
         assert len(valid_coords) != 0, "No valid pixels found for NN search."
 
         if len(target_indices) == 0:
-            print("No Other_tissue pixels found. No remapping needed.")
             return remap_segm
         else:
             tree = cKDTree(valid_coords)
@@ -567,3 +566,45 @@ class DatasetDIDC(Dataset):
 
     def __getitem__(self, idx):
         return {'input_label': self.fg_tensor[idx].float(), 'multiClassMask': self.segm_masks_tensor[idx]}
+
+# For preprocessed datasets already saved in data_path
+class FastDatasetDIDC(DatasetDIDC):
+    def __init__(self, data_path, file_list=None):
+        self.data_path = data_path
+
+        if file_list is None:
+            all_files = os.listdir(data_path)
+            patient_ids = sorted(list(set([f.replace('_fg.npy', '').replace('_mask.npy', '') for f in all_files if f.endswith('.npy')])))
+        else:
+            patient_ids = [f.replace('.npy', '') for f in file_list]
+
+        self.samples = []
+        for pat_id in patient_ids[:-1]:
+            fg_path = os.path.join(data_path, f"{pat_id}_fg.npy")
+
+            if os.path.exists(fg_path):
+                shape = np.load(fg_path, mmap_mode='r').shape 
+                num_slices = shape[0]
+
+                for i in range(num_slices):
+                    self.samples.append((pat_id, i))
+            else:
+                raise Warning(f"Foreground file for patient {pat_id} not found at {fg_path}. Skipping.")
+
+    def __len__(self):
+        return len(self.samples)
+    
+    def __getitem__(self, idx):
+        pat_id, slice_idx = self.samples[idx]
+        fg_path = os.path.join(self.data_path, f"{pat_id}_fg.npy")
+        mask_path = os.path.join(self.data_path, f"{pat_id}_mask.npy")
+
+        fg_slice = np.load(fg_path, mmap_mode='r')[slice_idx]
+        mask_slice = np.load(mask_path, mmap_mode='r')[slice_idx]
+
+        fg_tensor = torch.from_numpy(fg_slice.copy()).float()
+        mask_tensor = torch.from_numpy(mask_slice.copy()).long()
+
+        return {'input_label': fg_tensor, 'multiClassMask': mask_tensor}
+
+

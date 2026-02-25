@@ -13,7 +13,7 @@ from sklearn.model_selection import train_test_split
 from PIL import Image
 import torchvision
 from diffusers import AutoencoderKL, get_cosine_schedule_with_warmup
-from datasets import LazyDatasetDIDC
+from datasets import FastDatasetDIDC
 from mt_DIDC_config import GROUPING_RULES, NEW_LABELS
 from utils import multiclass_dice_loss, set_reproducibility, sanitize_config, sanitize_config
 
@@ -25,8 +25,6 @@ class VAETrainingConfig:
     target_size: int = 384
     val_fraction: float = 0.2
     num_input_classes: int = 22
-    rm_black_slices: bool = True
-    remap_nn: bool = True
     train_batch_size: int = 16
     eval_batch_size: int = 4  
     batch_size_per_gpu: int = 2
@@ -40,10 +38,7 @@ class VAETrainingConfig:
     up_block_types: tuple = ("UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D")
     
     num_fg_channels: int = 4
-    threshold_classes: int = 50
-    min_blob_size: int = 10
 
-    
     num_gpus: int = torch.cuda.device_count() if torch.cuda.is_available() else 1
     learning_rate: float = 1e-4
     lr_warmup_steps: int = 250
@@ -232,15 +227,27 @@ def main():
 
     set_reproducibility(config.seed)
     os.makedirs(config.exp_dir, exist_ok=True)
-
     log_file = open(f"{config.exp_dir}/log.txt", "w")
     sys.stdout = log_file
     sys.stderr = log_file
     print('Experiment directory:', config.exp_dir)
-    
-    all_files = sorted([f for f in os.listdir(config.data_path) if f.endswith('.npy')])
-    train_files, val_files = train_test_split(all_files, test_size=config.val_fraction, random_state=config.seed)
 
+    dataset_config_path = os.path.join(config.data_path, "dataset_config.json")
+    if os.path.exists(dataset_config_path):
+        with open(dataset_config_path, "r") as f:
+            dataset_config = json.load(f)
+        print("Dataset configuration loaded successfully")
+    else:
+        raise FileNotFoundError(f"Dataset configuration file not found at {dataset_config_path}. Please run the dataset preprocessing script first.")
+
+
+    all_files = sorted(list(set([
+        f.replace('_fg.npy', '').replace('_mask.npy', '') 
+        for f in all_files if f.endswith('.npy')
+    ]))) # compatible with all datatset versions, just extract the unique patient IDs from the file names
+
+    train_files, val_files = train_test_split(all_files, test_size=config.val_fraction, random_state=config.seed)
+    
     split_info = {
         'train_indices': train_files,
         'val_indices': val_files
@@ -251,34 +258,15 @@ def main():
 
     with open (f"{config.exp_dir}/grouping_rules_and_labels.json", "w") as f:
         json.dump({
-            'grouping_rules': GROUPING_RULES,
-            'new_labels': NEW_LABELS
+            'grouping_rules': dataset_config.get('grouping_rules_used'),
+            'new_labels': dataset_config.get('new_labels_used')
         }, f, indent=4)
 
     with open (f"{config.exp_dir}/training_config.json", "w") as f:
-        json.dump(sanitize_config(asdict(config)), f, indent=4)
+        json.dump({**sanitize_config(asdict(config)), **sanitize_config(config)}, f, indent=4)
 
-    train_dataset = LazyDatasetDIDC(config.data_path, 
-                                    GROUPING_RULES, 
-                                    NEW_LABELS, 
-                                    target_size=(config.target_size, config.target_size), 
-                                    num_input_classes=config.num_fg_channels, 
-                                    rm_black_slices=config.rm_black_slices, 
-                                    remap_nn=config.remap_nn, 
-                                    threshold_classes=config.threshold_classes, 
-                                    min_blob_size=config.min_blob_size,
-                                    file_list=train_files)
-    
-    val_dataset =  LazyDatasetDIDC(config.data_path, 
-                                   GROUPING_RULES, 
-                                   NEW_LABELS, 
-                                   target_size=(config.target_size, config.target_size), 
-                                   num_input_classes=config.num_fg_channels, 
-                                   rm_black_slices=config.rm_black_slices, 
-                                   remap_nn=config.remap_nn, 
-                                   threshold_classes=config.threshold_classes, 
-                                   min_blob_size=config.min_blob_size,
-                                   file_list=val_files)
+    train_dataset = FastDatasetDIDC(config.data_path, file_list=train_files)
+    val_dataset =  FastDatasetDIDC(config.data_path, file_list=val_files)
     
     train_dataloader = DataLoader(train_dataset, batch_size=config.batch_size_per_gpu, shuffle=True, num_workers=config.num_workers)
     val_dataloader = DataLoader(val_dataset, batch_size=config.batch_size_per_gpu, shuffle=False, num_workers=config.num_workers)
@@ -296,7 +284,7 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
     lr_scheduler = get_cosine_schedule_with_warmup(optimizer=optimizer, num_warmup_steps=config.lr_warmup_steps, num_training_steps=(len(train_dataloader) * config.num_epochs))
 
-    train_loop(config, model, optimizer, train_dataloader, val_dataloader, lr_scheduler)
+    # train_loop(config, model, optimizer, train_dataloader, val_dataloader, lr_scheduler)
 
     log_file.close()
 
