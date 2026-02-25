@@ -54,6 +54,14 @@ class VAETrainingConfig:
         self.gradient_accumulation_steps = max(1, self.train_batch_size // (self.batch_size_per_gpu * self.num_gpus))
         self.exp_dir = os.path.join(self.exp_dir, f"{datetime.now().strftime('%Y%m%d_%H%M')}_{self.run_name}")
 
+def calculate_adaptive_weight(recon_loss, g_loss, last_layer, disc_weight_max=0.75):
+    recon_grads = torch.autograd.grad(recon_loss, last_layer, retain_graph=True)[0]
+    g_grads = torch.autograd.grad(g_loss, last_layer, retain_graph=True)[0]
+
+    d_weight = torch.norm(recon_grads) / (torch.norm(g_grads) + 1e-4)
+    d_weight = torch.clamp(d_weight, 0.0, disc_weight_max).detach()
+    return d_weight
+
 def train_val_step(batch, model, num_classes, accelerator, optimizer=None, lr_scheduler=None, is_training=True, kl_weight=1e-5):
     assert not (is_training and optimizer is None), "Optimizer must be provided for training step"
 
@@ -85,10 +93,70 @@ def train_val_step(batch, model, num_classes, accelerator, optimizer=None, lr_sc
 
     return loss.detach().item(), recon_loss.detach().item(), kl_loss.detach().item(), dice_loss.detach().item()
 
+def train_vae_adv_step(batch, model, discriminator, num_classes, accelerator, 
+                       opt_vae, opt_disc, global_step, 
+                       disc_start_step=10000, kl_weight=1e-6):
+    
+    target_classes = batch['multiClassMask'].long()
+    if target_classes.dim() == 4: target_classes = target_classes.squeeze(1)
+
+    clean_images = F.one_hot(target_classes, num_classes=num_classes).permute(0, 3, 1, 2).float()
+    clean_images = clean_images * 2.0 - 1.0
+
+    # Training VAE (Generator)
+    posterior = model.encode(clean_images).latent_dist
+    z = posterior.sample()
+    reconstructed_logits = model.decode(z).sample
+
+    # Standard loss
+    recon_loss = F.cross_entropy(reconstructed_logits, target_classes)
+    dice_loss = multiclass_dice_loss(reconstructed_logits, target_classes)
+    kl_loss = posterior.kl().mean()
+    
+    # Perceptual loss (Esser et al.)
+    # p_loss = perceptual_loss(reconstructed_logits, clean_images) 
+    
+    v_loss = recon_loss + kl_weight * kl_loss # + p_loss
+
+    # Adversarial loss generator
+    logits_fake = discriminator(reconstructed_logits)
+    # Hinge loss for generator (should be ReLU(1-mean(logits_fake)) but Esser et al. use just -mean(logits_fake)) to encourage generator to always improve)
+    g_loss = -torch.mean(logits_fake) 
+
+    # Compute adaptive weight for adversarial loss after warmup (Esser et al.)
+    if global_step >= disc_start_step:
+        last_layer = model.decoder.conv_out.weight # weigths 
+        d_weight = calculate_adaptive_weight(v_loss, g_loss, last_layer)
+    else:
+        d_weight = 0.0
+
+    total_vae_loss = v_loss + d_weight * g_loss
+
+    opt_vae.zero_grad()
+    accelerator.backward(total_vae_loss)
+    opt_vae.step()
+
+    # Discriminator training after warmup
+    if global_step >= disc_start_step:
+        logits_real = discriminator(clean_images.detach())
+        logits_fake = discriminator(reconstructed_logits.detach())
+
+        # Classic hinge loss for discriminator
+        loss_real = torch.mean(F.relu(1. - logits_real))
+        loss_fake = torch.mean(F.relu(1. + logits_fake))
+        d_loss = 0.5 * (loss_real + loss_fake)
+
+        opt_disc.zero_grad()
+        accelerator.backward(d_loss)
+        opt_disc.step()
+    else:
+        d_loss = torch.tensor(0.0)
+
+    return total_vae_loss.item(), d_loss.item(), d_weight
+
 def sample_and_save_reconstructions(model, config, epoch, num_classes, accelerator, val_batch):
     """
-    Passa un batch reale nell'Autoencoder e salva l'originale affiancato alla ricostruzione.
-    Usa .mode() per l'inferenza deterministica e argmax sui logits.
+    Pass a real batch for visualization
     """
     model.eval()
     

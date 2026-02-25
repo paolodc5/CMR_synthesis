@@ -2,6 +2,8 @@ import torch
 from torch import nn
 from torchinfo import summary
 
+from gan_multidiscr import SingleDiscriminator
+
 # Generator block is a unet advanced modified with dropout
 
 # Repeated code! to be moved in a common script
@@ -73,8 +75,46 @@ class DiscriminatorModel(nn.Module):
         return out
 
 
+class DiscriminatorPatchGAN(nn.Module):
+    def __init__(self, in_ch=3, base_ch=64, n_layers=3):
+        super(DiscriminatorPatchGAN, self).__init__()
+        
+        # Esser et al. (through Isola et al.) they use PatchGAN architecture.
+        layers = [
+            nn.Conv2d(in_ch, base_ch, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(0.2, inplace=True)
+        ]
+        
+        # Intermediate layers use istance norm instead of batch norm, as suggested by Isola et al.
+        curr_ch = base_ch
+        for n in range(1, n_layers):
+            prev_ch = curr_ch
+            curr_ch = min(base_ch * (2**n), 512)
+            layers.extend([
+                nn.Conv2d(prev_ch, curr_ch, kernel_size=4, stride=2, padding=1),
+                nn.InstanceNorm2d(curr_ch),
+                nn.LeakyReLU(0.2, inplace=True)
+            ] )
+
+        # Penultimate layer: stride 1 to maintain spatial dimensions
+        prev_ch = curr_ch
+        curr_ch = min(base_ch * (2**n_layers), 512)
+        layers.extend([
+            nn.Conv2d(prev_ch, curr_ch, kernel_size=4, stride=1, padding=1),
+            nn.InstanceNorm2d(curr_ch),
+            nn.LeakyReLU(0.2, inplace=True)
+        ])
+
+        # Final layer: returns prediction map (real/fake) for each patch. No activation function
+        layers.append(nn.Conv2d(curr_ch, 1, kernel_size=4, stride=1, padding=1))
+        
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.model(x)
+
 
 if __name__ == "__main__":
-    discr = DiscriminatorModel(in_ch=4, base_ch=64, use_fc=False)
-    summary(discr, input_size=(2, 4, 256, 256))
+    discr = DiscriminatorPatchGAN(in_ch=6, base_ch=64, n_layers=3)
+    summary(discr, input_size=(2, 6, 384, 384))
 
