@@ -15,15 +15,16 @@ import torch.nn.functional as F
 from torch import device, nn, optim
 
 from utils import (multiclass_dice_loss,
-                   set_reproducibility)
-from datasets import DatasetDIDC, LazyDatasetDIDC
+                   set_reproducibility,
+                   sanitize_config)
+from datasets import FastDatasetDIDC
 from unet_advanced import UNetAdvanced as UNetGan
 from gan_multidiscr import MultiScaleDiscriminator
 from train_utils import EarlyStopping, save_checkpoint
 from mt_DIDC_config import GROUPING_RULES, NEW_LABELS
 
 
-DATA_FOLDER = "./DIDC_multiclass_coro_v2"
+DATA_FOLDER = "./DIDC_multiclass_coro_v2_prep"
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 SEED = 187
@@ -31,7 +32,7 @@ set_reproducibility(SEED)
 
 RUN_NAME = "MT_DIDC_multiscale"
 TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M")
-EXP_DIR = f"./experiments/DIDC/{TIMESTAMP}_{RUN_NAME}"
+EXP_DIR = f"./experiments/DIDCV2/{TIMESTAMP}_{RUN_NAME}"
 
 # Hyperparameters (not best practice to be defined here)
 NUM_STEPS = 15000
@@ -48,19 +49,13 @@ PATIENCE_ES = 25 # num * VAL_CHECK_INTERVAL steps with no improvement
 DELTA_ES = 0.01 # minimum improvement in validation dice loss to reset early stopping counter
 BATCH_SIZE = 8
 VAL_FRACTION = 0.2
-NOTES="Mutliscale gan on corov2 DIDC dataset hyperparams are set from last training, dimished batch size for single GPU training"
-PARALLEL = True
+NOTES="Mutliscale gan on corov2 offline-preprocessed dDIDC dataset. Dimished batch size for single GPU training"
+PARALLEL = False
 
 LAZY_DATASET = True
 NUM_WORKERS = 8 if LAZY_DATASET else 0 # Set num_workers > 0 only for LazyDataset to speed up data loading, for in-memory dataset it can cause unnecessary overhead and potential issues with multiprocessing on some platforms (e.g., Windows)
 PIN_MEMORY = False # Set pin_memory to True only for LazyDataset to speed up data transfer to GPU, for in-memory dataset it can cause unnecessary overhead
 NON_BLOCKING_GPU_LOADING = PIN_MEMORY # Set non_blocking to True only for LazyDataset to allow asynchronous GPU transfers, for in-memory dataset it can cause issues if the data is already on CPU and not pinned
-
-# preprocessing hyperparameters
-REMAP_NN = True # Whether to apply the NN remapping of "Other_tissue" pixels to the most common label among their k nearest neighbors that are not "Other_tissue". This is done in the DatasetDIDC class and can be turned on/off with this flag.
-THRESHOLD_CLASSES = 50 # Minimum number of pixels for a class to be kept, otherwise those pixels are set to "Other_tissue". Set to None to disable this step. 
-MIN_BLOB_SIZE = 10 # Minimum size of connected components to keep for each class, smaller blobs are removed. Set to None to disable this step.
-TARGET_SIZE = (384, 384) # Target size for resizing the input images and masks (H, W)
 
 
 def train_discriminator(batch, gen, discr, criterion_GAN, optim_discr, device='cpu'):
@@ -298,8 +293,23 @@ def main():
     print(f'Num available GPUs: ', torch.cuda.device_count())
     print(f"Device: {p.name} (Memory: {p.total_memory / 1e9:.2f} GB)")
 
+    dataset_config_path = os.path.join(DATA_FOLDER, "dataset_config.json")
+    if os.path.exists(dataset_config_path):
+        with open(dataset_config_path, "r") as f:
+            dataset_config = json.load(f)
+        print("Dataset configuration loaded successfully")
+    else:
+        raise FileNotFoundError(f"Dataset configuration file not found at {dataset_config_path}. Please run the dataset preprocessing script first.")
+
+
+
+
     # Dataset
     all_files = sorted([f for f in os.listdir(DATA_FOLDER) if f.endswith('.npy')])
+    all_files = sorted(list(set([
+        f.replace('_fg.npy', '').replace('_mask.npy', '') 
+        for f in all_files if f.endswith('.npy')
+    ]))) # compatible with all datatset versions, just extract the unique patient IDs from the file names
     train_files, val_files = train_test_split(all_files, test_size=VAL_FRACTION, random_state=SEED)
 
     ### Save train-val split indices for reproducibility, split is made patient-wise
@@ -312,12 +322,12 @@ def main():
     
     with open (f"{EXP_DIR}/grouping_rules_and_labels.json", "w") as f:
         json.dump({
-            'grouping_rules': GROUPING_RULES,
-            'new_labels': NEW_LABELS
+            'grouping_rules': dataset_config.get('grouping_rules_used'),
+            'new_labels': dataset_config.get('new_labels_used')
         }, f, indent=4)
 
-    train_dataset = LazyDatasetDIDC(DATA_FOLDER, GROUPING_RULES, NEW_LABELS, target_size=TARGET_SIZE, rm_black_slices=True, file_list=train_files, remap_nn=REMAP_NN, threshold_classes=THRESHOLD_CLASSES, min_blob_size=MIN_BLOB_SIZE)    
-    val_dataset = LazyDatasetDIDC(DATA_FOLDER, GROUPING_RULES, NEW_LABELS, target_size=TARGET_SIZE, rm_black_slices=True, file_list=val_files, remap_nn=REMAP_NN, threshold_classes=THRESHOLD_CLASSES, min_blob_size=MIN_BLOB_SIZE)    
+    train_dataset = FastDatasetDIDC(DATA_FOLDER, file_list=train_files)
+    val_dataset =  FastDatasetDIDC(DATA_FOLDER, file_list=val_files)
 
     train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
     val_dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
@@ -325,7 +335,7 @@ def main():
 
     # Training objects instantiation
     n_input_classes = 4
-    n_output_classes = len(train_dataset.new_labels)
+    n_output_classes = len(dataset_config.get('new_labels_used'))
     gen = UNetGan(in_ch=n_input_classes, num_classes=n_output_classes, dropout_p=DROPOUT_GEN).to(DEVICE)
     discr = MultiScaleDiscriminator(in_ch=n_input_classes+n_output_classes, n_discriminators=NUM_DISCRIMINATORS).to(DEVICE)
 
@@ -354,7 +364,6 @@ def main():
         'batch_size': train_dataloader.batch_size,
         'learning_rate_gen': optim_gen.param_groups[0]['lr'],
         'learning_rate_discr': optim_discr.param_groups[0]['lr'],
-        'remapping_nn': REMAP_NN,
         'batch_size': BATCH_SIZE,
         'notes': NOTES,
         'patience_es': PATIENCE_ES,
@@ -362,12 +371,9 @@ def main():
         'dropout_gen': DROPOUT_GEN,
         'num_gpus': torch.cuda.device_count() if PARALLEL else 1,
         'validation_fraction': VAL_FRACTION,
-        'target_size': TARGET_SIZE,
         'seed': SEED,
         'parallel': PARALLEL,
         'device_ids': device_ids,
-        'threshold_classes': THRESHOLD_CLASSES,
-        'min_blob_size': MIN_BLOB_SIZE,
         'num_workers': NUM_WORKERS,
         'pin_memory': PIN_MEMORY,
         'non_blocking_gpu_loading': NON_BLOCKING_GPU_LOADING,
@@ -375,7 +381,7 @@ def main():
     }
 
     with open(f"{EXP_DIR}/config.json", "w") as f:
-        json.dump(config, f, indent=4)
+        json.dump({**config, **sanitize_config(dataset_config)}, f, indent=4)
     
     # training loop
     history = train_gan(NUM_STEPS, 
