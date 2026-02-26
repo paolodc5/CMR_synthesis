@@ -2,8 +2,6 @@ import torch
 from torch import nn
 from torchinfo import summary
 
-from gan_multidiscr import SingleDiscriminator
-
 # Generator block is a unet advanced modified with dropout
 
 # Repeated code! to be moved in a common script
@@ -76,45 +74,79 @@ class DiscriminatorModel(nn.Module):
 
 
 class DiscriminatorPatchGAN(nn.Module):
-    def __init__(self, in_ch=3, base_ch=64, n_layers=3):
+    def __init__(self, in_ch=6, base_ch=64, n_layers=3):
         super(DiscriminatorPatchGAN, self).__init__()
-        
-        # Esser et al. (through Isola et al.) they use PatchGAN architecture.
-        layers = [
-            nn.Conv2d(in_ch, base_ch, kernel_size=4, stride=2, padding=1),
-            nn.LeakyReLU(0.2, inplace=True)
-        ]
-        
-        # Intermediate layers use istance norm instead of batch norm, as suggested by Isola et al.
+        self.blocks = nn.ModuleList()
+
+        self.blocks.append(
+            nn.Sequential(
+                nn.Conv2d(in_ch, base_ch, kernel_size=4, stride=2, padding=1),
+                nn.LeakyReLU(0.2, inplace=True)
+            )
+        )
+
         curr_ch = base_ch
         for n in range(1, n_layers):
             prev_ch = curr_ch
             curr_ch = min(base_ch * (2**n), 512)
-            layers.extend([
-                nn.Conv2d(prev_ch, curr_ch, kernel_size=4, stride=2, padding=1),
-                nn.InstanceNorm2d(curr_ch),
-                nn.LeakyReLU(0.2, inplace=True)
-            ] )
-
-        # Penultimate layer: stride 1 to maintain spatial dimensions
+            self.blocks.append(
+                nn.Sequential(
+                    nn.Conv2d(prev_ch, curr_ch, kernel_size=4, stride=2, padding=1),
+                    nn.InstanceNorm2d(curr_ch),
+                    nn.LeakyReLU(0.2, inplace=True)
+                )
+            )
+        
         prev_ch = curr_ch
         curr_ch = min(base_ch * (2**n_layers), 512)
-        layers.extend([
-            nn.Conv2d(prev_ch, curr_ch, kernel_size=4, stride=1, padding=1),
-            nn.InstanceNorm2d(curr_ch),
-            nn.LeakyReLU(0.2, inplace=True)
-        ])
+        self.blocks.append(
+            nn.Sequential(
+                nn.Conv2d(prev_ch, curr_ch, kernel_size=4, stride=1, padding=1),
+                nn.InstanceNorm2d(curr_ch),
+                nn.LeakyReLU(0.2, inplace=True)
+            )
+        )
 
-        # Final layer: returns prediction map (real/fake) for each patch. No activation function
-        layers.append(nn.Conv2d(curr_ch, 1, kernel_size=4, stride=1, padding=1))
-        
-        self.model = nn.Sequential(*layers)
-
+        self.blocks.append(nn.Conv2d(curr_ch, 1, kernel_size=4, stride=1, padding=1))
+    
     def forward(self, x):
-        return self.model(x)
+        features = []
+        for block in self.blocks:
+            x = block(x)
+            features.append(x)
+        return features[-1], features[:-1]
 
 
-if __name__ == "__main__":
-    discr = DiscriminatorPatchGAN(in_ch=6, base_ch=64, n_layers=3)
-    summary(discr, input_size=(2, 6, 384, 384))
+# if __name__ == "__main__":
+#     dummy_input = torch.randn(2, 6, 384, 384)
+#     discr = DiscriminatorPatchGAN(in_ch=6, base_ch=64, n_layers=3)
+#     out = discr(dummy_input)
+#     print(len(out))
+#     print(out[0].shape)
 
+#     criterion_l1 = nn.L1Loss()
+
+
+#     for i in out[1]:
+#         print(i.shape)
+
+#     # generate fake output for testing
+#     out_fake = []
+#     for i in out[1]:
+#         out_fake.append(torch.randn_like(i, requires_grad=True))
+#         print(out_fake[-1].shape)
+
+#     # out_fake.append(torch.randn_like(out[0], requires_grad=True))
+
+#     perc_loss = compute_perceptual_loss(out[1], out_fake, criterion_l1)
+#     print(perc_loss)
+#     optimizer = torch.optim.Adam(discr.parameters(), lr=1e-4)
+#     optimizer.zero_grad()
+#     perc_loss.backward()
+#     optimizer.step()
+
+#     print(f"Perceptual Loss: {perc_loss.item()}")
+#     print('gradients: ')
+#     for name, param in discr.named_parameters():
+#         if param.grad is not None:
+#             print(f"{name}: {param.grad.norm().item()}")

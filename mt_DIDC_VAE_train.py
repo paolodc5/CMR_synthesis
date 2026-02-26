@@ -14,6 +14,7 @@ from PIL import Image
 import torchvision
 from diffusers import AutoencoderKL, get_cosine_schedule_with_warmup
 from datasets import FastDatasetDIDC
+from gan_basic import DiscriminatorPatchGAN
 from mt_DIDC_config import GROUPING_RULES, NEW_LABELS
 from utils import multiclass_dice_loss, set_reproducibility, sanitize_config, sanitize_config
 
@@ -49,6 +50,7 @@ class VAETrainingConfig:
     notes: str = "VAE with KL divergence loss, Targeting 4 foreground classes with remapping and thresholding. NEW dataset coroV2"
     gradient_accumulation_steps: int = 1
     exp_dir = './experiments/DIDC_VAE' 
+    adv_train: bool = False # Whether to use adversarial training with a discriminator (PatchGAN) alongside the VAE. If True, discriminator and its optimizer will be initialized and used in the training loop.
 
     def __post_init__(self):
         self.gradient_accumulation_steps = max(1, self.train_batch_size // (self.batch_size_per_gpu * self.num_gpus))
@@ -116,7 +118,6 @@ def compute_perceptual_loss(discr_real, discr_fake, criterion_L1):
         total_loss += loss_discr # just a sum not a mean
     return total_loss
 
-
 def train_vae_adv_step(batch, model, discriminator, num_classes, accelerator, 
                        opt_vae, opt_disc, global_step, 
                        disc_start_step=10000, kl_weight=1e-6):
@@ -127,47 +128,50 @@ def train_vae_adv_step(batch, model, discriminator, num_classes, accelerator,
     clean_images = F.one_hot(target_classes, num_classes=num_classes).permute(0, 3, 1, 2).float()
     clean_images = clean_images * 2.0 - 1.0
 
-    # Training VAE (Generator)
     posterior = model.encode(clean_images).latent_dist
     z = posterior.sample()
     reconstructed_logits = model.decode(z).sample
 
-    # Standard loss
     recon_loss = F.cross_entropy(reconstructed_logits, target_classes)
     dice_loss = multiclass_dice_loss(reconstructed_logits, target_classes)
     kl_loss = posterior.kl().mean()
     
-    # Perceptual loss (Esser et al.)
-    # p_loss = perceptual_loss(reconstructed_logits, clean_images) 
+    real_features = discriminator(clean_images)
+    fake_features = discriminator(reconstructed_logits)
+    p_loss = compute_perceptual_loss(real_features, fake_features, torch.nn.L1Loss()) 
     
-    v_loss = recon_loss + kl_weight * kl_loss # + p_loss
+    v_loss = recon_loss + dice_loss + kl_weight * kl_loss + p_loss
 
-    # Adversarial loss generator
-    logits_fake = discriminator(reconstructed_logits)
-    # Hinge loss for generator (should be ReLU(1-mean(logits_fake)) but Esser et al. use just -mean(logits_fake)) to encourage generator to always improve)
-    g_loss = -torch.mean(logits_fake) 
-
-    # Compute adaptive weight for adversarial loss after warmup (Esser et al.)
     if global_step >= disc_start_step:
-        last_layer = model.decoder.conv_out.weight # weigths 
-        d_weight = calculate_adaptive_weight(v_loss, g_loss, last_layer)
-    else:
-        d_weight = 0.0
+        logits_fake = discriminator(reconstructed_logits)
+        g_loss = -torch.mean(logits_fake[0]) # Adversarial loss for generator (VAE decoder)
 
-    total_vae_loss = v_loss + d_weight * g_loss
+        last_layer = model.decoder.conv_out.weight
+        
+        v_loss_grads = torch.autograd.grad(v_loss, last_layer, retain_graph=True)[0]
+        g_loss_grads = torch.autograd.grad(g_loss, last_layer, retain_graph=True)[0]
+        
+        d_weight = torch.norm(v_loss_grads) / (torch.norm(g_loss_grads) + 1e-4)
+        d_weight = torch.clamp(d_weight, 0.0, 1e4).detach()
+        
+        total_vae_loss = v_loss + d_weight * g_loss
+    else:
+        d_weight = torch.tensor(0.0)
+        g_loss = torch.tensor(0.0)
+        total_vae_loss = v_loss
 
     opt_vae.zero_grad()
     accelerator.backward(total_vae_loss)
     opt_vae.step()
 
-    # Discriminator training after warmup
-    if global_step >= disc_start_step:
-        logits_real = discriminator(clean_images.detach())
-        logits_fake = discriminator(reconstructed_logits.detach())
 
-        # Classic hinge loss for discriminator
-        loss_real = torch.mean(F.relu(1. - logits_real))
-        loss_fake = torch.mean(F.relu(1. + logits_fake))
+    if global_step >= disc_start_step:
+        logits_real = discriminator(clean_images.contiguous().detach())
+        logits_fake_d = discriminator(reconstructed_logits.contiguous().detach())
+
+        # Hinge loss
+        loss_real = torch.mean(F.relu(1. - logits_real[0]))
+        loss_fake = torch.mean(F.relu(1. + logits_fake_d[0]))
         d_loss = 0.5 * (loss_real + loss_fake)
 
         opt_disc.zero_grad()
@@ -176,7 +180,9 @@ def train_vae_adv_step(batch, model, discriminator, num_classes, accelerator,
     else:
         d_loss = torch.tensor(0.0)
 
-    return total_vae_loss.item(), d_loss.item(), d_weight
+    d_weight_value = d_weight.item() if isinstance(d_weight, torch.Tensor) else d_weight
+
+    return total_vae_loss.item(), recon_loss.item(), kl_loss.item(), dice_loss.item(), d_loss.item(), d_weight_value
 
 def sample_and_save_reconstructions(model, config, epoch, num_classes, accelerator, val_batch):
     """
@@ -225,7 +231,9 @@ def sample_and_save_reconstructions(model, config, epoch, num_classes, accelerat
         img = Image.fromarray(combined_img, mode="L")
         img.save(os.path.join(image_dir, f"epoch_{epoch:04d}_sample_{i:02d}_(GT_vs_Recon).png"))
 
-def train_loop(config, model, optimizer, train_dataloader, val_dataloader, lr_scheduler):
+def train_loop(config, model, optimizer, train_dataloader, val_dataloader, lr_scheduler, adv_train=False, discriminator=None, opt_disc=None):
+    assert not adv_train or (adv_train and discriminator is not None and opt_disc is not None), "Discriminator and its optimizer must be provided for adversarial training"
+    
     accelerator = Accelerator(
         mixed_precision=config.mixed_precision,
         gradient_accumulation_steps=config.gradient_accumulation_steps,
@@ -242,10 +250,14 @@ def train_loop(config, model, optimizer, train_dataloader, val_dataloader, lr_sc
         'train_recon_loss': [],
         'train_kl_loss': [],
         'train_dice_loss': [],
+        'train_d_loss': [],
+        'train_d_weight': [],
         'val_loss': [],
         'val_recon_loss': [],
         'val_kl_loss': [],
         'val_dice_loss': [],
+        'val_d_loss': [],
+        'val_d_weight': [],
     }
 
     model, optimizer, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(
@@ -261,18 +273,26 @@ def train_loop(config, model, optimizer, train_dataloader, val_dataloader, lr_sc
 
         model.train()
         for step, batch in enumerate(train_dataloader):
-            total_loss, recon_loss, kl_loss, dice_loss = train_val_step(
-                batch, model, config.num_input_classes, accelerator, 
-                optimizer=optimizer, lr_scheduler=lr_scheduler, is_training=True, kl_weight=config.kl_weight
-            )
+            if adv_train:
+                total_loss, recon_loss, kl_loss, dice_loss, d_loss, d_weight = train_vae_adv_step(
+                    batch, model, discriminator, config.num_input_classes, accelerator, 
+                    optimizer, opt_disc, global_step, disc_start_step=0, kl_weight=config.kl_weight
+                )
+            else:
+                total_loss, recon_loss, kl_loss, dice_loss, d_loss, d_weight = train_val_step(
+                    batch, model, config.num_input_classes, accelerator, 
+                    optimizer=optimizer, lr_scheduler=lr_scheduler, is_training=True, kl_weight=config.kl_weight
+                )
             
-            logs = {"Loss/Total": total_loss, "Loss/Recon": recon_loss, "Loss/KL": kl_loss, "Loss/Dice": dice_loss, "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {"Loss/Total": total_loss, "Loss/Recon": recon_loss, "Loss/KL": kl_loss, "Loss/Dice": dice_loss, "Loss/Discriminator": d_loss, "Weight/Discriminator": d_weight, "lr": lr_scheduler.get_last_lr()[0]}
             accelerator.log(logs, step=global_step)
 
             metrics_hystory['train_loss'].append(total_loss)
             metrics_hystory['train_recon_loss'].append(recon_loss)
             metrics_hystory['train_kl_loss'].append(kl_loss)
             metrics_hystory['train_dice_loss'].append(dice_loss)
+            metrics_hystory['train_d_loss'].append(d_loss)
+            metrics_hystory['train_d_weight'].append(d_weight)
             metrics_hystory['current_epoch'] = epoch
 
             progress_bar.set_postfix(loss=total_loss, recon=recon_loss)
@@ -281,30 +301,43 @@ def train_loop(config, model, optimizer, train_dataloader, val_dataloader, lr_sc
 
         if accelerator.is_main_process:
             model.eval()
-            val_loss, val_recon, val_kl, val_dice = 0.0, 0.0, 0.0, 0.0
+            val_loss, val_recon, val_kl, val_dice, val_d_loss, val_d_weight = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
             
             for val_batch in val_dataloader:
-                v_tot, v_rec, v_kl, v_dice = train_val_step(
-                    val_batch, model, config.num_input_classes, accelerator, 
-                    is_training=False, kl_weight=config.kl_weight
-                )
+                if adv_train:
+                    v_tot, v_rec, v_kl, v_dice, v_d_loss, v_d_weight = train_vae_adv_step(
+                        val_batch, model, discriminator, config.num_input_classes, accelerator, 
+                        opt_vae=None, opt_disc=None, global_step=global_step, 
+                        disc_start_step=0, kl_weight=config.kl_weight
+                    )
+                else:
+                    v_tot, v_rec, v_kl, v_dice, v_d_loss, v_d_weight = train_val_step(
+                        val_batch, model, config.num_input_classes, accelerator, 
+                        is_training=False, kl_weight=config.kl_weight
+                    )
                 val_loss += v_tot
                 val_recon += v_rec
                 val_kl += v_kl
                 val_dice += v_dice
+                val_d_loss += v_d_loss
+                val_d_weight += v_d_weight
                 
             val_loss /= len(val_dataloader)
             val_recon /= len(val_dataloader)
             val_kl /= len(val_dataloader)
             val_dice /= len(val_dataloader)
+            val_d_loss /= len(val_dataloader)
+            val_d_weight /= len(val_dataloader)
             
-            accelerator.log({"Val_Loss/Total": val_loss, "Val_Loss/Recon": val_recon, "Val_Loss/KL": val_kl, "Val_Loss/Dice": val_dice}, step=global_step)
-            print(f"Epoch {epoch} | Val Recon Loss: {val_recon:.4f} | Val KL Loss: {val_kl:.4f} | Val Dice Loss: {val_dice:.4f}")
+            accelerator.log({"Val_Loss/Total": val_loss, "Val_Loss/Recon": val_recon, "Val_Loss/KL": val_kl, "Val_Loss/Dice": val_dice, "Val_Loss/Discriminator": val_d_loss, "Val_Weight/Discriminator": val_d_weight}, step=global_step)
+            print(f"Epoch {epoch} | Val Recon Loss: {val_recon:.4f} | Val KL Loss: {val_kl:.4f} | Val Dice Loss: {val_dice:.4f} | Val D Loss: {val_d_loss:.4f}")
 
             metrics_hystory['val_loss'].append(val_loss)
             metrics_hystory['val_recon_loss'].append(val_recon)
             metrics_hystory['val_kl_loss'].append(val_kl)
             metrics_hystory['val_dice_loss'].append(val_dice)
+            metrics_hystory['val_d_loss'].append(val_d_loss)
+            metrics_hystory['val_d_weight'].append(val_d_weight)
 
             unwrapped_model = accelerator.unwrap_model(model)
 
@@ -376,13 +409,50 @@ def main():
         block_out_channels=config.block_out_channels,         
         layers_per_block=config.layers_per_block,
     )
+
+    discr_model = DiscriminatorPatchGAN(in_ch=config.num_input_classes, base_ch=64, n_layers=3)
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+    optimizer_disc = torch.optim.AdamW(discr_model.parameters(), lr=config.learning_rate) # Placeholder, will be used if adv_train=True
     lr_scheduler = get_cosine_schedule_with_warmup(optimizer=optimizer, num_warmup_steps=config.lr_warmup_steps, num_training_steps=(len(train_dataloader) * config.num_epochs))
 
-    train_loop(config, model, optimizer, train_dataloader, val_dataloader, lr_scheduler)
+    train_loop(config, 
+               model, 
+               optimizer, 
+               train_dataloader, 
+               val_dataloader, 
+               lr_scheduler, 
+               discriminator=discr_model, 
+               opt_disc=optimizer_disc, 
+               adv_train=config.adv_train
+               )
 
     log_file.close()
 
 if __name__ == '__main__':
-    main()
+    # main()
+    # test train_vae_adv_step with dummy data
+    accelerator = Accelerator()
+    batch_size = 2
+    num_classes = 22
+    dummy_batch = {
+        'multiClassMask': torch.randint(0, num_classes, (batch_size, 384, 384), device=accelerator.device)
+    }
+    model = AutoencoderKL(
+        in_channels=num_classes,      
+        out_channels=num_classes,     
+        latent_channels=4,    
+        down_block_types=("DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D"),
+        up_block_types=("UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D"),
+        block_out_channels=(64, 128, 256),         
+        layers_per_block=2,
+    ).to(accelerator.device)
+    discriminator = DiscriminatorPatchGAN(in_ch=num_classes, base_ch=64, n_layers=3).to(accelerator.device)
+    opt_vae = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    opt_disc = torch.optim.AdamW(discriminator.parameters(), lr=1e-4)
+    global_step = 0
+    total_vae_loss, recon_loss, kl_loss, dice_loss, d_loss, d_weight = train_vae_adv_step(
+        dummy_batch, model, discriminator, num_classes, accelerator, 
+        opt_vae, opt_disc, global_step, disc_start_step=0, kl_weight=1e-6
+    )
+    print(f"Total VAE Loss: {total_vae_loss:.4f}, Recon Loss: {recon_loss:.4f}, KL Loss: {kl_loss:.4f}, Dice Loss: {dice_loss:.4f}, Discriminator Loss: {d_loss:.4f}, Discriminator Weight: {d_weight:.4f}")
