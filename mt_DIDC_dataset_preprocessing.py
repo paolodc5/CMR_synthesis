@@ -62,14 +62,16 @@ def create_mmap_dataset(source_dir, dest_dir):
 
             fg_proc, mask_proc = dataset.process_slice(fg_slice, mask_slice)
 
+            if fg_proc.dim() == 4 and fg_proc.shape[0] == 1:
+                fg_proc = fg_proc.squeeze(0)
+                
+            if mask_proc.dim() == 3 and mask_proc.shape[0] == 1:
+                mask_proc = mask_proc.squeeze(0)
+
             fg_list.append(fg_proc)
             mask_list.append(mask_proc)        
 
-        if fg_proc.dim() == 4 and fg_proc.shape[0] == 1:
-            fg_proc = fg_proc.squeeze(0)
-                
-        if mask_proc.dim() == 3 and mask_proc.shape[0] == 1:
-            mask_proc = mask_proc.squeeze(0)
+
 
         fg_stack = torch.stack(fg_list, dim=0)
         mask_stack = torch.stack(mask_list, dim=0)

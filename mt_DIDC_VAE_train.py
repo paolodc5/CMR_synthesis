@@ -93,6 +93,30 @@ def train_val_step(batch, model, num_classes, accelerator, optimizer=None, lr_sc
 
     return loss.detach().item(), recon_loss.detach().item(), kl_loss.detach().item(), dice_loss.detach().item()
 
+# Currently not used
+def compute_perceptual_loss(discr_real, discr_fake, criterion_L1):
+    """
+    Function to compute perceptual loss between features from the generated image and features from the ground truth image.
+    
+    :param discr_real: List of tuples containing discriminator outputs and features for real images
+    :param discr_fake: List of tuples containing discriminator outputs and features for fake images
+    :param criterion_L1: Loss function to compute the perceptual loss (e.g., L1Loss or MSELoss)
+    :return: Computed perceptual loss averaged across all feature map pairs
+    """
+    total_loss = 0.0
+    for real_pred, fake_pred in zip(discr_real, discr_fake):
+        real_feat = real_pred[1] # Get features from the discriminator's forward pass on real pairs
+        fake_feat = fake_pred[1] # Get features from the discriminator's forward pass on fake pairs
+        
+        loss_discr = 0.0
+        for rf, ff in zip(real_feat, fake_feat):
+            loss_layer = criterion_L1(ff, rf.detach()) # Compute L1 loss between fake and real features
+            loss_discr += loss_layer
+            
+        total_loss += loss_discr # just a sum not a mean
+    return total_loss
+
+
 def train_vae_adv_step(batch, model, discriminator, num_classes, accelerator, 
                        opt_vae, opt_disc, global_step, 
                        disc_start_step=10000, kl_weight=1e-6):

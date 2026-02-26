@@ -568,7 +568,7 @@ class DatasetDIDC(Dataset):
         return {'input_label': self.fg_tensor[idx].float(), 'multiClassMask': self.segm_masks_tensor[idx]}
 
 # For preprocessed datasets already saved in data_path
-class FastDatasetDIDC(DatasetDIDC):
+class FastDatasetDIDC(Dataset):
     def __init__(self, data_path, file_list=None):
         self.data_path = data_path
 
@@ -589,7 +589,7 @@ class FastDatasetDIDC(DatasetDIDC):
                 for i in range(num_slices):
                     self.samples.append((pat_id, i))
             else:
-                raise Warning(f"Foreground file for patient {pat_id} not found at {fg_path}. Skipping.")
+                print(f"Foreground file for patient {pat_id} not found at {fg_path}. Skipping.")
 
     def __len__(self):
         return len(self.samples)
