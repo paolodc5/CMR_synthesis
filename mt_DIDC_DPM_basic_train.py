@@ -25,7 +25,6 @@ from mt_DIDC_config import GROUPING_RULES, NEW_LABELS
 from utils import set_reproducibility, sanitize_config, multiclass_dice_loss
 
 
-
 @dataclass
 class TrainingConfig:
     run_name: str = "DDPM_conditional_train"
@@ -43,7 +42,7 @@ class TrainingConfig:
 
     train_batch_size: int = 16
     eval_batch_size: int = 4 
-    batch_size_per_gpu: int = 2
+    batch_size_per_gpu: int = 8
  
     num_epochs: int = 100
     conditional_generation: bool = True
@@ -52,8 +51,8 @@ class TrainingConfig:
     learning_rate: float = 1e-4
     lr_warmup_steps: int = 250
 
-    save_image_epochs: int = 10
-    save_model_epochs: int = 8
+    save_image_epochs: int = 5
+    save_model_epochs: int = 5
     
     num_workers: int = 8
     num_gpus: int = torch.cuda.device_count() if torch.cuda.is_available() else 1
@@ -329,8 +328,8 @@ def main():
     with open (f"{config.exp_dir}/training_config.json", "w") as f:
         json.dump({**asdict(config), **dataset_config}, f, indent=4)
     
-    train_dataset = CustomDataset(config.data_path, target_size=config.target_size, file_list=train_files)
-    val_dataset =  CustomDataset(config.data_path, target_size=config.target_size, file_list=val_files)
+    train_dataset = CustomDataset(config.data_path, target_size=(config.target_size, config.target_size), file_list=train_files)
+    val_dataset =  CustomDataset(config.data_path, target_size=(config.target_size, config.target_size), file_list=val_files)
     
     train_dataloader = DataLoader(train_dataset, batch_size=config.batch_size_per_gpu, shuffle=True, num_workers=config.num_workers)
     val_dataloader = DataLoader(val_dataset, batch_size=config.batch_size_per_gpu, shuffle=False, num_workers=config.num_workers)
@@ -355,15 +354,15 @@ def main():
     log_file.close()
 
 if __name__ == '__main__':
-    # main()
-    model = UNet2DModel(sample_size=128,  
-                        in_channels=26, 
-                        out_channels=22, 
-                        layers_per_block=2, 
-                        block_out_channels=(128, 256, 512, 512),
-                        down_block_types=("DownBlock2D", "DownBlock2D", "AttnDownBlock2D", "DownBlock2D"),
-                        up_block_types=("UpBlock2D", "AttnUpBlock2D", "UpBlock2D", "UpBlock2D")
-                        )
-    fake_input_tensor = torch.randn(4, 26, 384, 384) # (Batch, Channels, Height, Width)
-    fake_timestep = torch.randint(0, 1000, (4,))
-    summary(model, input_data=[fake_input_tensor, fake_timestep], depth=4)
+    main()
+    # model = UNet2DModel(sample_size=128,  
+    #                     in_channels=26, 
+    #                     out_channels=22, 
+    #                     layers_per_block=2, 
+    #                     block_out_channels=(128, 256, 512, 512),
+    #                     down_block_types=("DownBlock2D", "DownBlock2D", "AttnDownBlock2D", "DownBlock2D"),
+    #                     up_block_types=("UpBlock2D", "AttnUpBlock2D", "UpBlock2D", "UpBlock2D")
+    #                     )
+    # fake_input_tensor = torch.randn(4, 26, 384, 384) # (Batch, Channels, Height, Width)
+    # fake_timestep = torch.randint(0, 1000, (4,))
+    # summary(model, input_data=[fake_input_tensor, fake_timestep], depth=4)

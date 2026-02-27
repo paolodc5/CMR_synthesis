@@ -31,20 +31,23 @@ class VAETrainingConfig:
     batch_size_per_gpu: int = 4
     num_epochs: int = 170
     
-    latent_channels: int = 4 # Compresses the input mask (22 channels) into a 4-channel latent space (bottleneck)
+    latent_channels: int = 8 # Compresses the input mask (22 channels)
     kl_weight: float = 1e-5  # weight for KL divergence in the loss function
     layers_per_block: int = 2
     block_out_channels: tuple = (64, 128, 256)
-    down_block_types: tuple = ("DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D")
-    up_block_types: tuple = ("UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D")
+    down_block_types: tuple = ("DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D")
+    up_block_types: tuple = ("UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D")
     
     num_fg_channels: int = 4
+
+    sensitive_labels = ['Background', 'LV_Myocardium', 'LV_blood_pool', 'RV_blood_pool_myocardium', 'Lungs']
+    class_weight_sensitive = 10.0
 
     num_gpus: int = torch.cuda.device_count() if torch.cuda.is_available() else 1
     learning_rate: float = 1e-4
     lr_warmup_steps: int = 250
-    save_image_epochs: int = 10
-    save_model_epochs: int = 8
+    save_image_epochs: int = 1
+    save_model_epochs: int = 1
     mixed_precision: str = "fp16"
     seed: int = 187
     notes: str = "VAE with KL divergence loss, Targeting 4 foreground classes with remapping and thresholding. NEW dataset coroV2"
@@ -65,7 +68,7 @@ def calculate_adaptive_weight(recon_loss, g_loss, last_layer, disc_weight_max=0.
     d_weight = torch.clamp(d_weight, 0.0, disc_weight_max).detach()
     return d_weight
 
-def train_val_step(batch, model, num_classes, accelerator, optimizer=None, lr_scheduler=None, is_training=True, kl_weight=1e-5):
+def train_val_step(batch, model, num_classes, accelerator, optimizer=None, lr_scheduler=None, is_training=True, kl_weight=1e-5, class_weights=None):
     assert not (is_training and optimizer is None), "Optimizer must be provided for training step"
 
     target_classes = batch['multiClassMask'].long() # Shape: (B, H, W)
@@ -80,7 +83,12 @@ def train_val_step(batch, model, num_classes, accelerator, optimizer=None, lr_sc
         z = posterior.sample()
         reconstructed_logits = model.decode(z).sample
 
-        recon_loss = F.cross_entropy(reconstructed_logits, target_classes) 
+        if class_weights is not None:
+            weights_tensor = torch.tensor(class_weights, device=reconstructed_logits.device)
+        else:
+            weights_tensor = None
+
+        recon_loss = F.cross_entropy(reconstructed_logits, target_classes, weight=weights_tensor)
         dice_loss = multiclass_dice_loss(reconstructed_logits, target_classes)
         kl_loss = posterior.kl().mean()
         loss = recon_loss + kl_weight * kl_loss
@@ -121,7 +129,7 @@ def compute_perceptual_loss(discr_real, discr_fake, criterion_L1):
 
 def train_vae_adv_step(batch, model, discriminator, num_classes, accelerator, 
                        opt_vae, opt_disc, global_step, 
-                       disc_start_step=10000, kl_weight=1e-6, is_training=True):
+                       disc_start_step=10000, kl_weight=1e-6, is_training=True, class_weights=None):
     
     target_classes = batch['multiClassMask'].long()
     if target_classes.dim() == 4: target_classes = target_classes.squeeze(1)
@@ -134,7 +142,12 @@ def train_vae_adv_step(batch, model, discriminator, num_classes, accelerator,
         z = posterior.sample()
         reconstructed_logits = model.decode(z).sample
 
-        recon_loss = F.cross_entropy(reconstructed_logits, target_classes)
+        if class_weights is not None:
+            weights_tensor = torch.tensor(class_weights, device=reconstructed_logits.device)
+        else:
+            weights_tensor = None
+
+        recon_loss = F.cross_entropy(reconstructed_logits, target_classes, weight=weights_tensor)
         dice_loss = multiclass_dice_loss(reconstructed_logits, target_classes)
         kl_loss = posterior.kl().mean()
     
@@ -240,7 +253,7 @@ def sample_and_save_reconstructions(model, config, epoch, num_classes, accelerat
         img = Image.fromarray(combined_img, mode="L")
         img.save(os.path.join(image_dir, f"epoch_{epoch:04d}_sample_{i:02d}_(GT_vs_Recon).png"))
 
-def train_loop(config, model, optimizer, train_dataloader, val_dataloader, lr_scheduler, adv_train=False, discriminator=None, opt_disc=None):
+def train_loop(config, model, optimizer, train_dataloader, val_dataloader, lr_scheduler, adv_train=False, discriminator=None, opt_disc=None, class_weights=None):
     assert not adv_train or (adv_train and discriminator is not None and opt_disc is not None), "Discriminator and its optimizer must be provided for adversarial training"
     
     accelerator = Accelerator(
@@ -426,6 +439,18 @@ def main():
     optimizer_disc = torch.optim.AdamW(discr_model.parameters(), lr=config.learning_rate) # Placeholder, will be used if adv_train=True
     lr_scheduler = get_cosine_schedule_with_warmup(optimizer=optimizer, num_warmup_steps=config.lr_warmup_steps, num_training_steps=(len(train_dataloader) * config.num_epochs))
 
+    if config.sensitive_labels:
+        class_weights = []
+        for label in dataset_config["new_labels_used"]:
+                if label in config.sensitive_labels:
+                    class_weights.append(config.class_weight_sensitive) 
+                else:
+                    class_weights.append(1.0)
+    else:
+        class_weights = None
+        
+    print("Class weights for training:", class_weights)
+
     train_loop(config, 
                model, 
                optimizer, 
@@ -434,35 +459,11 @@ def main():
                lr_scheduler, 
                discriminator=discr_model, 
                opt_disc=optimizer_disc, 
-               adv_train=config.adv_train
+               adv_train=config.adv_train,
+               class_weights=class_weights
                )
 
     log_file.close()
 
 if __name__ == '__main__':
     main()
-    # # test train_vae_adv_step with dummy data
-    # accelerator = Accelerator()
-    # batch_size = 2
-    # num_classes = 22
-    # dummy_batch = {
-    #     'multiClassMask': torch.randint(0, num_classes, (batch_size, 384, 384), device=accelerator.device)
-    # }
-    # model = AutoencoderKL(
-    #     in_channels=num_classes,      
-    #     out_channels=num_classes,     
-    #     latent_channels=4,    
-    #     down_block_types=("DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D"),
-    #     up_block_types=("UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D"),
-    #     block_out_channels=(64, 128, 256),         
-    #     layers_per_block=2,
-    # ).to(accelerator.device)
-    # discriminator = DiscriminatorPatchGAN(in_ch=num_classes, base_ch=64, n_layers=3).to(accelerator.device)
-    # opt_vae = torch.optim.AdamW(model.parameters(), lr=1e-4)
-    # opt_disc = torch.optim.AdamW(discriminator.parameters(), lr=1e-4)
-    # global_step = 0
-    # total_vae_loss, recon_loss, kl_loss, dice_loss = train_val_step(
-    #     dummy_batch, model, num_classes, accelerator, 
-    #     opt_vae, global_step, kl_weight=1e-6
-    # )
-    # print(f"Total VAE Loss: {total_vae_loss:.4f}, Recon Loss: {recon_loss:.4f}, KL Loss: {kl_loss:.4f}, Dice Loss: {dice_loss:.4f}, Discriminator Loss: {d_loss:.4f}, Discriminator Weight: {d_weight:.4f}")
