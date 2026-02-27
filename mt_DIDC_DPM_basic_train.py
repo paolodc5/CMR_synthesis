@@ -6,6 +6,8 @@ import sys
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+import torchvision.transforms.functional as TF
+from torchinfo import summary
 
 from accelerate import Accelerator
 
@@ -18,19 +20,18 @@ from sklearn.model_selection import train_test_split
 from PIL import Image
 
 from diffusers import DDPMScheduler, UNet2DModel, get_cosine_schedule_with_warmup
-from datasets import LazyDatasetDIDC
+from datasets import FastDatasetDIDC
 from mt_DIDC_config import GROUPING_RULES, NEW_LABELS
 from utils import set_reproducibility, sanitize_config, multiclass_dice_loss
+
 
 
 @dataclass
 class TrainingConfig:
     run_name: str = "DDPM_conditional_train"
-    data_path: str = "./New_dictionary"
-    num_workers: int = 8
-    remap_nn: bool = True
-    threshold_classes: int = 50
-    min_blob_size: int = 10
+    data_path: str = "./DIDC_multiclass_coro_v2_prep"
+    exp_dir = './experiments/DIDCV2/diffusion' 
+
     target_size: int = 128
     val_fraction: float = 0.2
     num_input_classes: int = 22
@@ -39,26 +40,28 @@ class TrainingConfig:
     unet_down_block_types: tuple = ("DownBlock2D", "DownBlock2D", "AttnDownBlock2D", "DownBlock2D")
     unet_up_block_types: tuple = ("UpBlock2D", "AttnUpBlock2D", "UpBlock2D", "UpBlock2D")
     unet_blocks_out_channels: tuple = (128, 256, 512, 512)
-    rm_black_slices: bool = True
-    remap_nn: bool = True
+
     train_batch_size: int = 16
-    eval_batch_size: int = 4  
-    num_epochs: int = 170
+    eval_batch_size: int = 4 
+    batch_size_per_gpu: int = 2
+ 
+    num_epochs: int = 100
     conditional_generation: bool = True
     num_train_timesteps: int = 1000
-    num_sample_steps: int = 50
-    batch_size_per_gpu: int = 8
-    num_gpus: int = torch.cuda.device_count() if torch.cuda.is_available() else 1
+    num_sample_steps: int = 150
     learning_rate: float = 1e-4
     lr_warmup_steps: int = 250
+
     save_image_epochs: int = 10
     save_model_epochs: int = 8
+    
+    num_workers: int = 8
+    num_gpus: int = torch.cuda.device_count() if torch.cuda.is_available() else 1
     mixed_precision: str = "fp16"  # `no` for float32, `fp16` for automatic mixed precision
-    notes: str = "Diffusion model first CONDITIONAL training more epochs, logging dice loss on generated samples"
+    notes: str = "Diffusion model first CONDITIONAL training more epochs, meant as benchmark"
     seed: int = 187
     
     gradient_accumulation_steps: int = 1
-    exp_dir = './experiments/DIDC' 
 
     def __post_init__(self):
         self.gradient_accumulation_steps = max(
@@ -67,6 +70,37 @@ class TrainingConfig:
         )
         self.exp_dir = os.path.join(self.exp_dir, f"{datetime.now().strftime('%Y%m%d_%H%M')}_{self.run_name}")
         self.fg_channels = self.num_fg_channels if self.conditional_generation else 0
+
+
+class CustomDataset(FastDatasetDIDC):
+    """
+    Dataset class that inherits from FastDatasetDIDC and adds the ability to resize the input_label and multiClassMask to a custom target size during training.
+    This allows for more flexible training with different image resolutions without needing to preprocess the dataset multiple times. 
+    The resizing is done using nearest neighbor interpolation to preserve the discrete class labels in the segmentation masks.
+    """
+    def __init__(self, data_path, target_size, file_list=None):
+        super().__init__(data_path, file_list)
+        self.custom_target_shape = target_size
+
+    def __getitem__(self, idx):
+        sample = super().__getitem__(idx)
+
+        if self.custom_target_shape is not None:
+            input_label = sample['input_label']
+            multi_class_mask = sample['multiClassMask']
+
+            if not isinstance(self.custom_target_shape, tuple) or len(self.custom_target_shape) != 2:
+                raise ValueError("custom_target_shape must be a tuple with 2 elements (height, width)")
+
+            # Resize input_label
+            input_label = TF.resize(input_label, size=self.custom_target_shape, interpolation=TF.InterpolationMode.NEAREST)
+            multi_class_mask = TF.resize(multi_class_mask.unsqueeze(0), size=self.custom_target_shape, interpolation=TF.InterpolationMode.NEAREST).squeeze(0)
+
+            sample['input_label'] = input_label
+            sample['multiClassMask'] = multi_class_mask
+
+        return sample
+
 
 def train_val_step(batch, model, num_classes, noise_scheduler, accelerator, lr_scheduler=None, optimizer=None, is_training=True, conditional_generation=False):
     assert not (is_training and optimizer is None), "Optimizer must be provided for training step"
@@ -80,7 +114,7 @@ def train_val_step(batch, model, num_classes, noise_scheduler, accelerator, lr_s
     fg_masks = fg_masks.float() * 2.0 - 1.0 
 
     batch_size = clean_images.size(0)
-    timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (batch_size,), device=accelerator.device).long()
+    timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (batch_size,), device=accelerator.device).long() # adds random timesteps for each image in the batch, shape (B,)
 
     noise = torch.randn_like(clean_images.float())
     noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
@@ -130,7 +164,7 @@ def sample_and_save_images(model, noise_scheduler, config, epoch, num_classes, a
             x = noise_scheduler.step(noise_pred, t, x).prev_sample # Standard DDPM step, scheduler subtracts the predicted noise
 
     dice_loss = multiclass_dice_loss(x, val_batch['multiClassMask'].long())
-    if isinstance(dice_loss, torch.Tensor): dice_loss = dice_loss.item()
+    if isinstance(dice_loss, torch.Tensor): dice_loss = dice_loss.item() # Check for compatibility
     print(f"Epoch {epoch} - Sample Dice Loss: {dice_loss:.4f}")
 
     x_classes = torch.argmax(x, dim=1) # Shape becomes (Batch, H, W)
@@ -202,7 +236,6 @@ def train_loop(config, model, noise_scheduler, optimizer, train_dataloader, val_
                                   conditional_generation=config.conditional_generation, 
                                   is_training=True
                                   )
-            # WARNING: to be fixed, logging every epoch instead of every step, otherwise it becomes too verbose !!!!!!!!!!!!!!!
             avg_loss += loss
             logs = {"loss": loss, "lr": lr_scheduler.get_last_lr()[0], "step": global_step}
             accelerator.log(logs, step=global_step)
@@ -216,10 +249,8 @@ def train_loop(config, model, noise_scheduler, optimizer, train_dataloader, val_
         metrics_history['train_loss'].append(avg_loss)
         metrics_history['lr'].append(lr_scheduler.get_last_lr()[0])
         metrics_history['current_epoch'] = epoch
-            
 
-        if accelerator.is_main_process:
-            # validation
+        if accelerator.is_main_process: # Avoid doing validation and sampling on every process
             model.eval()
             
             val_loss = 0.0
@@ -265,7 +296,20 @@ def main():
     sys.stderr = log_file
     print('Experiment directory:', config.exp_dir)
     
+    dataset_config_path = os.path.join(config.data_path, "dataset_config.json")
+    if os.path.exists(dataset_config_path):
+        with open(dataset_config_path, "r") as f:
+            dataset_config = json.load(f)
+        print("Dataset configuration loaded successfully")
+    else:
+        raise FileNotFoundError(f"Dataset configuration file not found at {dataset_config_path}. Please run the dataset preprocessing script first.")
+
     all_files = sorted([f for f in os.listdir(config.data_path) if f.endswith('.npy')])
+    all_files = sorted(list(set([
+        f.replace('_fg.npy', '').replace('_mask.npy', '') 
+        for f in all_files if f.endswith('.npy')
+    ]))) # compatible with all datatset versions, just extract the unique patient IDs from the file names
+
     train_files, val_files = train_test_split(all_files, test_size=config.val_fraction, random_state=config.seed)
 
     split_info = {
@@ -283,34 +327,13 @@ def main():
         }, f, indent=4)
 
     with open (f"{config.exp_dir}/training_config.json", "w") as f:
-        json.dump(asdict(config), f, indent=4)
+        json.dump({**asdict(config), **dataset_config}, f, indent=4)
     
-    train_dataset = LazyDatasetDIDC(config.data_path, 
-                                    GROUPING_RULES, 
-                                    NEW_LABELS, 
-                                    target_size=(config.target_size, config.target_size), 
-                                    num_input_classes=config.num_fg_channels, 
-                                    rm_black_slices=config.rm_black_slices, 
-                                    remap_nn=config.remap_nn, 
-                                    threshold_classes=config.threshold_classes, 
-                                    min_blob_size=config.min_blob_size,
-                                    file_list=train_files)
-    
-    val_dataset =  LazyDatasetDIDC(config.data_path, 
-                                   GROUPING_RULES, 
-                                   NEW_LABELS, 
-                                   target_size=(config.target_size, config.target_size), 
-                                   num_input_classes=config.num_fg_channels, 
-                                   rm_black_slices=config.rm_black_slices, 
-                                   remap_nn=config.remap_nn, 
-                                   threshold_classes=config.threshold_classes, 
-                                   min_blob_size=config.min_blob_size,
-                                   file_list=val_files)
+    train_dataset = CustomDataset(config.data_path, target_size=config.target_size, file_list=train_files)
+    val_dataset =  CustomDataset(config.data_path, target_size=config.target_size, file_list=val_files)
     
     train_dataloader = DataLoader(train_dataset, batch_size=config.batch_size_per_gpu, shuffle=True, num_workers=config.num_workers)
     val_dataloader = DataLoader(val_dataset, batch_size=config.batch_size_per_gpu, shuffle=False, num_workers=config.num_workers)
-
-
 
     noise_scheduler = DDPMScheduler(num_train_timesteps=config.num_train_timesteps, beta_schedule="sigmoid")
     
@@ -332,4 +355,15 @@ def main():
     log_file.close()
 
 if __name__ == '__main__':
-    main()
+    # main()
+    model = UNet2DModel(sample_size=128,  
+                        in_channels=26, 
+                        out_channels=22, 
+                        layers_per_block=2, 
+                        block_out_channels=(128, 256, 512, 512),
+                        down_block_types=("DownBlock2D", "DownBlock2D", "AttnDownBlock2D", "DownBlock2D"),
+                        up_block_types=("UpBlock2D", "AttnUpBlock2D", "UpBlock2D", "UpBlock2D")
+                        )
+    fake_input_tensor = torch.randn(4, 26, 384, 384) # (Batch, Channels, Height, Width)
+    fake_timestep = torch.randint(0, 1000, (4,))
+    summary(model, input_data=[fake_input_tensor, fake_timestep], depth=4)

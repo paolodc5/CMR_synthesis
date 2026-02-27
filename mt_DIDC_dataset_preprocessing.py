@@ -11,12 +11,12 @@ def create_mmap_dataset(source_dir, dest_dir):
     
     dataset_params = {
         "source_data": source_dir,
-        "target_size": 64,
+        "target_size_preprocessing": 384,
         "rm_black_slices": True,
         "remap_nn": False,
         "threshold_classes": None,
         "min_blob_size": None,
-        "num_input_classes": 4,
+        "num_fg_classes_preprocessing": 4,
         "grouping_rules_used": GROUPING_RULES,
         "new_labels_used": NEW_LABELS
     }
@@ -34,9 +34,10 @@ def create_mmap_dataset(source_dir, dest_dir):
             new_labels=NEW_LABELS,
             rm_black_slices=dataset_params["rm_black_slices"],
             remap_nn=dataset_params["remap_nn"],
-            num_input_classes=dataset_params["num_input_classes"],
-            file_list=files[:2]  # It is just for class initialization, the actual process is implemented below
-        )
+            num_input_classes=dataset_params["num_fg_classes_preprocessing"],
+            file_list=files[:2],  # It is just for class initialization, the actual process is implemented below
+            target_size=(dataset_params["target_size_preprocessing"], dataset_params["target_size_preprocessing"]),
+            )
     
     for file in tqdm(files, desc="Processing files"):
         pat_id = file.replace('.npy', '')

@@ -50,7 +50,8 @@ class VAETrainingConfig:
     notes: str = "VAE with KL divergence loss, Targeting 4 foreground classes with remapping and thresholding. NEW dataset coroV2"
     gradient_accumulation_steps: int = 1
     exp_dir = './experiments/DIDC_VAE' 
-    adv_train: bool = False # Whether to use adversarial training with a discriminator (PatchGAN) alongside the VAE. If True, discriminator and its optimizer will be initialized and used in the training loop.
+    adv_train: bool = False # Whether to use adversarial training with a discriminator (PatchGAN) alongside the VAE. 
+    disc_start_step: int = 150
 
     def __post_init__(self):
         self.gradient_accumulation_steps = max(1, self.train_batch_size // (self.batch_size_per_gpu * self.num_gpus))
@@ -120,7 +121,7 @@ def compute_perceptual_loss(discr_real, discr_fake, criterion_L1):
 
 def train_vae_adv_step(batch, model, discriminator, num_classes, accelerator, 
                        opt_vae, opt_disc, global_step, 
-                       disc_start_step=10000, kl_weight=1e-6):
+                       disc_start_step=10000, kl_weight=1e-6, is_training=True):
     
     target_classes = batch['multiClassMask'].long()
     if target_classes.dim() == 4: target_classes = target_classes.squeeze(1)
@@ -128,31 +129,36 @@ def train_vae_adv_step(batch, model, discriminator, num_classes, accelerator,
     clean_images = F.one_hot(target_classes, num_classes=num_classes).permute(0, 3, 1, 2).float()
     clean_images = clean_images * 2.0 - 1.0
 
-    posterior = model.encode(clean_images).latent_dist
-    z = posterior.sample()
-    reconstructed_logits = model.decode(z).sample
+    with torch.set_grad_enabled(is_training):
+        posterior = model.encode(clean_images).latent_dist
+        z = posterior.sample()
+        reconstructed_logits = model.decode(z).sample
 
-    recon_loss = F.cross_entropy(reconstructed_logits, target_classes)
-    dice_loss = multiclass_dice_loss(reconstructed_logits, target_classes)
-    kl_loss = posterior.kl().mean()
+        recon_loss = F.cross_entropy(reconstructed_logits, target_classes)
+        dice_loss = multiclass_dice_loss(reconstructed_logits, target_classes)
+        kl_loss = posterior.kl().mean()
     
-    real_features = discriminator(clean_images)
-    fake_features = discriminator(reconstructed_logits)
-    p_loss = compute_perceptual_loss(real_features, fake_features, torch.nn.L1Loss()) 
+        real_features = discriminator(clean_images)
+        fake_features = discriminator(reconstructed_logits)
+        p_loss = compute_perceptual_loss(real_features, fake_features, torch.nn.L1Loss()) 
     
     v_loss = recon_loss + dice_loss + kl_weight * kl_loss + p_loss
 
     if global_step >= disc_start_step:
-        logits_fake = discriminator(reconstructed_logits)
-        g_loss = -torch.mean(logits_fake[0]) # Adversarial loss for generator (VAE decoder)
+        with torch.set_grad_enabled(is_training):
+            logits_fake = discriminator(reconstructed_logits)
+            g_loss = -torch.mean(logits_fake[0]) # Adversarial loss for generator (VAE decoder)
 
-        last_layer = model.decoder.conv_out.weight
-        
-        v_loss_grads = torch.autograd.grad(v_loss, last_layer, retain_graph=True)[0]
-        g_loss_grads = torch.autograd.grad(g_loss, last_layer, retain_graph=True)[0]
-        
-        d_weight = torch.norm(v_loss_grads) / (torch.norm(g_loss_grads) + 1e-4)
-        d_weight = torch.clamp(d_weight, 0.0, 1e4).detach()
+            if is_training:
+                last_layer = model.decoder.conv_out.weight
+                
+                v_loss_grads = torch.autograd.grad(v_loss, last_layer, retain_graph=True)[0]
+                g_loss_grads = torch.autograd.grad(g_loss, last_layer, retain_graph=True)[0]
+                
+                d_weight = torch.norm(v_loss_grads) / (torch.norm(g_loss_grads) + 1e-4)
+                d_weight = torch.clamp(d_weight, 0.0, 1e4).detach()
+            else:
+                d_weight = torch.tensor(0.0, device=v_loss.device)
         
         total_vae_loss = v_loss + d_weight * g_loss
     else:
@@ -160,23 +166,26 @@ def train_vae_adv_step(batch, model, discriminator, num_classes, accelerator,
         g_loss = torch.tensor(0.0)
         total_vae_loss = v_loss
 
-    opt_vae.zero_grad()
-    accelerator.backward(total_vae_loss)
-    opt_vae.step()
+    if is_training:
+        opt_vae.zero_grad()
+        accelerator.backward(total_vae_loss)
+        opt_vae.step()
 
-
+    
     if global_step >= disc_start_step:
-        logits_real = discriminator(clean_images.contiguous().detach())
-        logits_fake_d = discriminator(reconstructed_logits.contiguous().detach())
+        with torch.set_grad_enabled(is_training):
+            logits_real = discriminator(clean_images.contiguous().detach())
+            logits_fake_d = discriminator(reconstructed_logits.contiguous().detach())
 
         # Hinge loss
         loss_real = torch.mean(F.relu(1. - logits_real[0]))
         loss_fake = torch.mean(F.relu(1. + logits_fake_d[0]))
         d_loss = 0.5 * (loss_real + loss_fake)
-
-        opt_disc.zero_grad()
-        accelerator.backward(d_loss)
-        opt_disc.step()
+        
+        if is_training:
+            opt_disc.zero_grad()
+            accelerator.backward(d_loss)
+            opt_disc.step()
     else:
         d_loss = torch.tensor(0.0)
 
@@ -267,6 +276,7 @@ def train_loop(config, model, optimizer, train_dataloader, val_dataloader, lr_sc
     fixed_sample_batch = next(iter(val_dataloader))
     global_step = 0
 
+    total_loss, recon_loss, kl_loss, dice_loss, d_loss, d_weight = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
     for epoch in range(config.num_epochs):
         progress_bar = tqdm(total=len(train_dataloader), disable=not accelerator.is_local_main_process, file=sys.__stderr__)
         progress_bar.set_description(f"Epoch {epoch}")
@@ -276,7 +286,7 @@ def train_loop(config, model, optimizer, train_dataloader, val_dataloader, lr_sc
             if adv_train:
                 total_loss, recon_loss, kl_loss, dice_loss, d_loss, d_weight = train_vae_adv_step(
                     batch, model, discriminator, config.num_input_classes, accelerator, 
-                    optimizer, opt_disc, global_step, disc_start_step=0, kl_weight=config.kl_weight
+                    optimizer, opt_disc, global_step, disc_start_step=config.disc_start_step, kl_weight=config.kl_weight
                 )
             else:
                 total_loss, recon_loss, kl_loss, dice_loss, d_loss, d_weight = train_val_step(
@@ -308,7 +318,7 @@ def train_loop(config, model, optimizer, train_dataloader, val_dataloader, lr_sc
                     v_tot, v_rec, v_kl, v_dice, v_d_loss, v_d_weight = train_vae_adv_step(
                         val_batch, model, discriminator, config.num_input_classes, accelerator, 
                         opt_vae=None, opt_disc=None, global_step=global_step, 
-                        disc_start_step=0, kl_weight=config.kl_weight
+                        disc_start_step=config.disc_start_step, kl_weight=config.kl_weight
                     )
                 else:
                     v_tot, v_rec, v_kl, v_dice, v_d_loss, v_d_weight = train_val_step(
@@ -430,29 +440,29 @@ def main():
     log_file.close()
 
 if __name__ == '__main__':
-    # main()
-    # test train_vae_adv_step with dummy data
-    accelerator = Accelerator()
-    batch_size = 2
-    num_classes = 22
-    dummy_batch = {
-        'multiClassMask': torch.randint(0, num_classes, (batch_size, 384, 384), device=accelerator.device)
-    }
-    model = AutoencoderKL(
-        in_channels=num_classes,      
-        out_channels=num_classes,     
-        latent_channels=4,    
-        down_block_types=("DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D"),
-        up_block_types=("UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D"),
-        block_out_channels=(64, 128, 256),         
-        layers_per_block=2,
-    ).to(accelerator.device)
-    discriminator = DiscriminatorPatchGAN(in_ch=num_classes, base_ch=64, n_layers=3).to(accelerator.device)
-    opt_vae = torch.optim.AdamW(model.parameters(), lr=1e-4)
-    opt_disc = torch.optim.AdamW(discriminator.parameters(), lr=1e-4)
-    global_step = 0
-    total_vae_loss, recon_loss, kl_loss, dice_loss, d_loss, d_weight = train_vae_adv_step(
-        dummy_batch, model, discriminator, num_classes, accelerator, 
-        opt_vae, opt_disc, global_step, disc_start_step=0, kl_weight=1e-6
-    )
-    print(f"Total VAE Loss: {total_vae_loss:.4f}, Recon Loss: {recon_loss:.4f}, KL Loss: {kl_loss:.4f}, Dice Loss: {dice_loss:.4f}, Discriminator Loss: {d_loss:.4f}, Discriminator Weight: {d_weight:.4f}")
+    main()
+    # # test train_vae_adv_step with dummy data
+    # accelerator = Accelerator()
+    # batch_size = 2
+    # num_classes = 22
+    # dummy_batch = {
+    #     'multiClassMask': torch.randint(0, num_classes, (batch_size, 384, 384), device=accelerator.device)
+    # }
+    # model = AutoencoderKL(
+    #     in_channels=num_classes,      
+    #     out_channels=num_classes,     
+    #     latent_channels=4,    
+    #     down_block_types=("DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D"),
+    #     up_block_types=("UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D"),
+    #     block_out_channels=(64, 128, 256),         
+    #     layers_per_block=2,
+    # ).to(accelerator.device)
+    # discriminator = DiscriminatorPatchGAN(in_ch=num_classes, base_ch=64, n_layers=3).to(accelerator.device)
+    # opt_vae = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    # opt_disc = torch.optim.AdamW(discriminator.parameters(), lr=1e-4)
+    # global_step = 0
+    # total_vae_loss, recon_loss, kl_loss, dice_loss = train_val_step(
+    #     dummy_batch, model, num_classes, accelerator, 
+    #     opt_vae, global_step, kl_weight=1e-6
+    # )
+    # print(f"Total VAE Loss: {total_vae_loss:.4f}, Recon Loss: {recon_loss:.4f}, KL Loss: {kl_loss:.4f}, Dice Loss: {dice_loss:.4f}, Discriminator Loss: {d_loss:.4f}, Discriminator Weight: {d_weight:.4f}")

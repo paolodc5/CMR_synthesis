@@ -608,12 +608,46 @@ class FastDatasetDIDC(Dataset):
         return {'input_label': fg_tensor, 'multiClassMask': mask_tensor}
 
 
+
+class CustomDataset(FastDatasetDIDC):
+    def __init__(self, data_path, target_size, file_list=None):
+        super().__init__(data_path, file_list)
+        self.custom_target_shape = target_size
+
+    def __getitem__(self, idx):
+        sample = super().__getitem__(idx)
+
+        if self.custom_target_shape is not None:
+            input_label = sample['input_label']
+            multi_class_mask = sample['multiClassMask']
+
+            if not isinstance(self.custom_target_shape, tuple) or len(self.custom_target_shape) != 2:
+                raise ValueError("custom_target_shape must be a tuple with 2 elements (height, width)")
+
+            # Resize input_label
+            input_label = TF.resize(input_label, size=self.custom_target_shape, interpolation=TF.InterpolationMode.NEAREST)
+            multi_class_mask = TF.resize(multi_class_mask.unsqueeze(0), size=self.custom_target_shape, interpolation=TF.InterpolationMode.NEAREST).squeeze(0)
+
+            sample['input_label'] = input_label
+            sample['multiClassMask'] = multi_class_mask
+
+        return sample
+
 if __name__ == "__main__":
     # test FastDatasetDIDC
     data_path = "DIDC_multiclass_coro_v2_prep"
-    dataset = FastDatasetDIDC(data_path)
+    dataset = CustomDataset(data_path, target_size=(128,128))
     print(f"Dataset length: {len(dataset)}")
     sample = dataset[0]
     print(f"Sample keys: {sample.keys()}")
     print(f"Input label shape: {sample['input_label'].shape}, dtype: {sample['input_label'].dtype}")
     print(f"Multi-class mask shape: {sample['multiClassMask'].shape}, dtype: {sample['multiClassMask'].dtype}")
+
+    sample_save_path = "sample_output.png"
+    input_label_vis = sample['input_label'].argmax(dim=0).numpy().astype(np.uint8) * (255 // sample['input_label'].shape[0]) # simple visualization
+    multi_class_mask_vis = sample['multiClassMask'].numpy().astype(np.uint8) * (255 // sample['multiClassMask'].max().item()) # simple visualization
+    input_label_vis = cv2.applyColorMap(input_label_vis, cv2.COLORMAP_JET)
+    multi_class_mask_vis = cv2.applyColorMap(multi_class_mask_vis, cv2.COLORMAP_JET)
+    cv2.imwrite(sample_save_path, input_label_vis)
+    cv2.imwrite(sample_save_path.replace('.png', '_mask.png'), multi_class_mask_vis)
+    print(f"Sample input label visualization saved to {sample_save_path}")
