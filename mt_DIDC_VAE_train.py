@@ -20,7 +20,7 @@ from utils import multiclass_dice_loss, set_reproducibility, sanitize_config, sa
 
 @dataclass
 class VAETrainingConfig:
-    run_name: str = "VAE_KL_train"
+    run_name: str = "VAE_KL_train_no_adv"
     data_path: str = "./DIDC_multiclass_coro_v2_prep"
     num_workers: int = 8
     val_fraction: float = 0.2
@@ -134,7 +134,7 @@ def train_vae_adv_step(batch, model, discriminator, num_classes, accelerator,
     if target_classes.dim() == 4: target_classes = target_classes.squeeze(1)
 
     clean_images = F.one_hot(target_classes, num_classes=num_classes).permute(0, 3, 1, 2).float()
-    clean_images = clean_images * 2.0 - 1.0
+    clean_images = clean_images * 2.0 - 1.0 # SCALING IMPORTANT
 
     with torch.set_grad_enabled(is_training):
         posterior = model.encode(clean_images).latent_dist
@@ -341,7 +341,7 @@ def train_loop(config, model, optimizer, train_dataloader, val_dataloader, lr_sc
             model.eval()
             val_loss, val_recon, val_kl, val_dice, val_d_loss, val_d_weight = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
             
-            for val_batch in val_dataloader:
+            for val_step, val_batch in enumerate(val_dataloader):
                 if adv_train:
                     v_tot, v_rec, v_kl, v_dice, v_d_loss, v_d_weight = train_vae_adv_step(
                         val_batch, 
@@ -358,7 +358,7 @@ def train_loop(config, model, optimizer, train_dataloader, val_dataloader, lr_sc
                         class_weights=class_weights
                     )
                 else:
-                    v_tot, v_rec, v_kl, v_dice, v_d_loss, v_d_weight = train_val_step(
+                    v_tot, v_rec, v_kl, v_dice = train_val_step(
                         val_batch, 
                         model, 
                         config.num_input_classes, 
@@ -367,6 +367,8 @@ def train_loop(config, model, optimizer, train_dataloader, val_dataloader, lr_sc
                         kl_weight=config.kl_weight, 
                         class_weights=class_weights
                     )
+                    v_d_loss, v_d_weight = 0.0, 0.0
+
                 val_loss += v_tot
                 val_recon += v_rec
                 val_kl += v_kl

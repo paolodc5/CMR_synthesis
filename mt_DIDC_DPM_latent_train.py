@@ -1,49 +1,50 @@
 import os
 import sys
-
-# os.environ["CUDA_VISIBLE_DEVICES"] = "0"  
+import logging
+import json
+import numpy as np
+from datetime import datetime
+from dataclasses import dataclass, asdict
+from PIL import Image
+from tqdm.auto import tqdm
+from sklearn.model_selection import train_test_split
 
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import torchvision.transforms.functional as TF
-from torchinfo import summary
 
 from accelerate import Accelerator
+from accelerate.logging import get_logger
+from diffusers import DDPMScheduler, UNet2DModel, AutoencoderKL, get_cosine_schedule_with_warmup
 
-import numpy as np
-import json
-from tqdm import tqdm
-from dataclasses import dataclass, asdict
-from datetime import datetime
-from sklearn.model_selection import train_test_split
-from PIL import Image
-
-from diffusers import DDPMScheduler, UNet2DModel, get_cosine_schedule_with_warmup
+# Import custom (assumendo che esistano nel tuo environment)
 from datasets import FastDatasetDIDC
 from mt_DIDC_config import GROUPING_RULES, NEW_LABELS
 from utils import set_reproducibility, sanitize_config, multiclass_dice_loss
 
+logger = get_logger(__name__, log_level="INFO")
 
 @dataclass
 class TrainingConfig:
-    run_name: str = "DDPM_conditional_train"
+    run_name: str = "LDM_conditional_train"
     data_path: str = "./DIDC_multiclass_coro_v2_prep"
-    exp_dir = './experiments/DIDCV2/diffusion' 
+    exp_dir: str = './experiments/DIDCV2/diffusion' 
+    vae_pretrained_path: str = "./experiments/DIDC_VAE/20260225_1651_VAE_KL_train/checkpoint_epoch"
 
-    target_size: int = 128
     val_fraction: float = 0.2
     num_input_classes: int = 22
-    num_fg_channels: int = 4
-    unet_layers_per_block: int = 2
+        
+    # UNet Config
     unet_down_block_types: tuple = ("DownBlock2D", "DownBlock2D", "AttnDownBlock2D", "DownBlock2D")
     unet_up_block_types: tuple = ("UpBlock2D", "AttnUpBlock2D", "UpBlock2D", "UpBlock2D")
     unet_blocks_out_channels: tuple = (128, 256, 512, 512)
+    unet_layers_per_block: int = 2
 
+    # Training params
     train_batch_size: int = 16
     eval_batch_size: int = 4 
     batch_size_per_gpu: int = 8
- 
     num_epochs: int = 100
     conditional_generation: bool = True
     num_train_timesteps: int = 1000
@@ -51,106 +52,339 @@ class TrainingConfig:
     learning_rate: float = 1e-4
     lr_warmup_steps: int = 250
 
-    save_image_epochs: int = 5
-    save_model_epochs: int = 5
-    
+    # Logging & Saving
+    save_image_epochs: int = 1
+    save_model_epochs: int = 1
     num_workers: int = 8
-    num_gpus: int = torch.cuda.device_count() if torch.cuda.is_available() else 1
-    mixed_precision: str = "fp16"  # `no` for float32, `fp16` for automatic mixed precision
-    notes: str = "Diffusion model first CONDITIONAL training more epochs, meant as benchmark"
+    mixed_precision: str = "fp16" 
+    notes: str = "Latent Diffusion model conditional training with custom VAE"
     seed: int = 187
     
     gradient_accumulation_steps: int = 1
+    run_dir: str = ""
 
     def __post_init__(self):
-        self.gradient_accumulation_steps = max(
-            1, 
-            self.train_batch_size // (self.batch_size_per_gpu * self.num_gpus)
-        )
-        self.exp_dir = os.path.join(self.exp_dir, f"{datetime.now().strftime('%Y%m%d_%H%M')}_{self.run_name}")
-        self.fg_channels = self.num_fg_channels if self.conditional_generation else 0
+        num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+        self.gradient_accumulation_steps = max(1, self.train_batch_size // (self.batch_size_per_gpu * num_gpus))
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M')
+        self.run_dir = os.path.join(self.exp_dir, f"{timestamp}_{self.run_name}")
 
 
+class CustomDataset(FastDatasetDIDC):
+    def __init__(self, data_path, target_size, file_list=None):
+        super().__init__(data_path, file_list)
+        self.custom_target_shape = target_size
 
-class DDPM(torch.nn.Module):
-    def __init__(self, unet, autoencoder, autoencoder_fg, noise_scheduler, config):
-        super().__init__()
-        self.unet = unet
-        self.autoencoder = autoencoder
-        self.autoencoder_fg = autoencoder_fg
-        self.noise_scheduler = noise_scheduler
+    def __getitem__(self, idx):
+        sample = super().__getitem__(idx)
+        if self.custom_target_shape is not None:
+            input_label = sample['input_label']
+            multi_class_mask = sample['multiClassMask']
+            
+            input_label = TF.resize(input_label, size=self.custom_target_shape, interpolation=TF.InterpolationMode.NEAREST)
+            multi_class_mask = TF.resize(multi_class_mask.unsqueeze(0), size=self.custom_target_shape, interpolation=TF.InterpolationMode.NEAREST).squeeze(0)
+
+            sample['input_label'] = input_label
+            sample['multiClassMask'] = multi_class_mask
+        return sample
+
+
+class LatentDiffusionTrainer:
+    def __init__(self, config: TrainingConfig, model, vae, noise_scheduler, optimizer, lr_scheduler, train_loader, val_loader, accelerator, scale_factor, new_labels):
         self.config = config
-        self.scale_factor = getattr(self.config, "scale_factor", 0.18215)  # default value from SD
+        self.model = model
+        self.vae = vae
+        self.noise_scheduler = noise_scheduler
+        self.optimizer = optimizer
+        self.lr_scheduler = lr_scheduler
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.accelerator = accelerator
+        self.scale_factor = scale_factor
+        self.new_labels = new_labels
 
-
-        self.autoencoder.eval()  
-        self.autoencoder_fg.eval()  
-        for param in self.autoencoder.parameters():
-            param.requires_grad = False  
-        for param in self.autoencoder_fg.parameters():
-            param.requires_grad = False  
-
+        self.metrics_history = {
+            'train_loss': [], 'val_loss': [], 'sample_dice_loss': [], 'lr': []
+        }
+        self.fixed_sample_batch = next(iter(self.val_loader))
 
     @torch.no_grad()
-    def encode_to_latent(self, x, is_fg=False):
-        if is_fg:
-            latent = self.autoencoder_fg.encode(x)  
-        else:
-            latent = self.autoencoder.encode(x)
-    
-        return latent.latent_dist.sample()  # return the sample from the latent distribution        
-
-    def forward(self, batch):
-        # encode input mask
-        input_mask = batch['multiClassMask']  # shape (B, H, W)
-        input_mask = F.one_hot(input_mask, num_classes=self.config.num_input_classes).permute(0, 3, 1, 2).float()  # shape (B, C_in, H, W)
-        z0 = self.encode_to_latent(input_mask)  # shape (B, C_encoded, H_enc, W_enc)        
-        # scale z0 to match the expected input range of the noise scheduler (e.g., [-1, 1])
-        z0 = z0 * 2 - 1  # assuming the autoencoder outputs in [0, 1], scale to [-1, 1]
-
-
-        # encode the foreground 
-        fg = batch['input_label']  # shape (B, C_fg, H, W)
-        enc_fg = self.encode_to_latent(fg, is_fg=True)  # shape (B, C_encoded, H_enc, W_enc)
+    def encode_to_latent(self, x, is_fg=False, use_mode=False):
+        """Handles scaling and encoding of both clean images and foreground masks into the VAE latent space."""
+        x = x * 2.0 - 1.0 # Pixel from [0,1] to [-1,1]
         
-        # compute noise and add to the input mask
-        B = z0.shape[0]
-        timesteps = torch.randint(0, self.config.num_train_timesteps, (B,), device=z0.device).long()
+        posterior = self.vae.encode(x).latent_dist # Same VAE for both images and fg masks
+        
+        if use_mode or is_fg:
+            z = posterior.mode()
+        else:
+            z = posterior.sample()
+            
+        return z * self.scale_factor
+
+    def _preprocess_batch(self, batch):
+        """Extracts pixels and foreground masks, prepares them fot eh UNet"""
+        clean_images = batch['multiClassMask'] 
+        fg_masks = batch['input_label'] 
+
+        clean_images = F.one_hot(clean_images.long(), num_classes=self.config.num_input_classes).permute(0, 3, 1, 2).float() 
+        fg_masks = fg_masks.float() 
+
+        B, _, H, W = fg_masks.shape
+        
+        mapped_fg_masks = torch.zeros(
+            (B, self.config.num_input_classes, H, W), 
+            device=fg_masks.device, 
+            dtype=fg_masks.dtype
+        )
+
+        fg_indices = self.new_labels.index('Background') 
+        
+        mapped_fg_masks[:, fg_indices, :, :] = fg_masks
+
+
+        # encoding
+        z0 = self.encode_to_latent(clean_images, is_fg=False, use_mode=False)
+        enc_fg = self.encode_to_latent(mapped_fg_masks, is_fg=True, use_mode=True)
+        
+        return z0, enc_fg
+
+    def step(self, batch, is_training=True):
+        z0, enc_fg = self._preprocess_batch(batch)
+        batch_size = z0.size(0)
+
+        timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (batch_size,), device=self.accelerator.device).long()
         noise = torch.randn_like(z0)
         z_t = self.noise_scheduler.add_noise(z0, noise, timesteps)
 
-        # concatenate the noisy input mask with the conditioning encoded foreground
-        cond_input = torch.cat([z_t, enc_fg], dim=1)  # shape (B, 2*C_encoded, H_enc, W_enc)
+        # Concatenazione nello spazio latente
+        net_input = torch.cat([z_t, enc_fg], dim=1) if self.config.conditional_generation else z_t
 
-        # forward pass through the UNet
-        unet_output = self.unet(cond_input, timesteps)
-        loss = F.mse_loss(unet_output.sample, noise)
+        with torch.set_grad_enabled(is_training):
+            noise_pred = self.model(net_input, timesteps).sample
+            loss = F.mse_loss(noise_pred, noise)
 
-        return loss
+        if is_training: 
+            with self.accelerator.accumulate(self.model):
+                self.optimizer.zero_grad()
+                self.accelerator.backward(loss)
+                if self.accelerator.sync_gradients:
+                    self.accelerator.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+                self.lr_scheduler.step()
 
-
-class Sampler:
-    def __init__(self, model, noise_scheduler, config):
-        self.model = model
-        self.noise_scheduler = noise_scheduler
-        self.config = config
+        return loss.detach().item()
 
     @torch.no_grad()
-    def sample(self, conditioning_fg):
-        B, C_fg, H, W = conditioning_fg.shape
-        latent_shape = (B, self.config.unet_blocks_out_channels[0], H // 8, W // 8)  # assuming 3 downsamplings with factor 2 each
-        z_t = torch.randn(latent_shape, device=conditioning_fg.device)  # start from pure noise
+    def generate_and_log_samples(self, epoch):
+        self.model.eval()
+        unwrapped_model = self.accelerator.unwrap_model(self.model)
 
-        for t in tqdm(reversed(range(self.config.num_sample_steps)), desc="Sampling"):
-            timesteps = torch.full((B,), t * (self.config.num_train_timesteps // self.config.num_sample_steps), device=conditioning_fg.device, dtype=torch.long)
-            cond_input = torch.cat([z_t, conditioning_fg], dim=1)  # shape (B, C_encoded*2, H_enc, W_enc)
-            unet_output = self.model.unet(cond_input, timesteps)
-            noise_pred = unet_output.sample
+        # foreground encoding in latent space
+        _, enc_fg = self._preprocess_batch(self.fixed_sample_batch)
+        actual_batch_size = enc_fg.size(0)
 
-            z_t = self.noise_scheduler.step(noise_pred, t * (self.config.num_train_timesteps // self.config.num_sample_steps), z_t)
+        # Noise generation (latent shape)
+        noise_shape = (actual_batch_size, self.config.latent_channels, enc_fg.shape[2], enc_fg.shape[3])
+        generator = torch.Generator(device=self.accelerator.device).manual_seed(self.config.seed)
+        z_t = torch.randn(noise_shape, generator=generator, device=self.accelerator.device)
 
-        return z_t
+        self.noise_scheduler.set_timesteps(self.config.num_sample_steps, device=self.accelerator.device)
 
-if __name__ == "__main__":
-    # test train_val_step
-    pass
+        # Reverse diffusion process (sampling) with conditioning on the encoded foreground masks
+        for t in tqdm(self.noise_scheduler.timesteps, desc=f"Sampling E{epoch}", leave=False, disable=not self.accelerator.is_local_main_process):
+            net_input = torch.cat([z_t, enc_fg], dim=1) if self.config.conditional_generation else z_t 
+            noise_pred = unwrapped_model(net_input, t).sample
+            z_t = self.noise_scheduler.step(noise_pred, t, z_t).prev_sample 
+
+        # Decoding step
+        z_0_rescaled = z_t / self.scale_factor
+        output_logits = self.vae.decode(z_0_rescaled).sample
+
+        dice_loss = multiclass_dice_loss(output_logits, self.fixed_sample_batch['multiClassMask'].long())
+        if isinstance(dice_loss, torch.Tensor): dice_loss = dice_loss.item()
+        logger.info(f"Epoch {epoch} - Sample Dice Loss: {dice_loss:.4f}")
+
+        # Tracking and image saving
+        x_classes = torch.argmax(output_logits, dim=1) 
+        tb_images = x_classes.unsqueeze(1).float() / (self.config.num_input_classes - 1) 
+
+        for tracker in self.accelerator.trackers: 
+            if tracker.name == "tensorboard":
+                tracker.writer.add_images("generated_samples", tb_images, epoch)
+        
+        masks_np = x_classes.cpu().numpy()
+        scale_factor = 255.0 / (self.config.num_input_classes - 1) if self.config.num_input_classes > 1 else 1.0
+        masks_np_visual = (masks_np * scale_factor).astype(np.uint8)
+        
+        image_dir = os.path.join(self.config.run_dir, "samples")
+        os.makedirs(image_dir, exist_ok=True)
+        for i, mask_array in enumerate(masks_np_visual):
+            img = Image.fromarray(mask_array, mode="L")
+            img.save(os.path.join(image_dir, f"epoch_{epoch:04d}_sample_{i:02d}.png"))
+
+        return dice_loss
+
+    def save_checkpoint(self, epoch):
+        checkpoint_path = os.path.join(self.config.run_dir, f"checkpoint_epoch")
+        unwrapped_model = self.accelerator.unwrap_model(self.model)
+        unwrapped_model.save_pretrained(checkpoint_path)
+        self.noise_scheduler.save_pretrained(checkpoint_path)
+
+        with open(os.path.join(self.config.run_dir, f"metrics_history.json"), "w") as f:
+            json.dump(self.metrics_history, f, indent=4)
+
+    def train(self):
+        global_step = 0
+        for epoch in range(self.config.num_epochs):
+            self.model.train()
+            avg_loss = 0.0
+            progress_bar = tqdm(total=len(self.train_loader), disable=not self.accelerator.is_local_main_process, desc=f"Epoch {epoch}")
+
+            for step, batch in enumerate(self.train_loader):
+                loss = self.step(batch, is_training=True) # Actual training step
+                avg_loss += loss
+                
+                current_lr = self.lr_scheduler.get_last_lr()[0]
+                logs = {"train_loss": loss, "lr": current_lr}
+                self.accelerator.log(logs, step=global_step)
+
+                progress_bar.set_postfix(**logs)
+                progress_bar.update(1)
+                global_step += 1
+
+            avg_loss /= len(self.train_loader)
+            self.metrics_history['train_loss'].append(avg_loss)
+            self.metrics_history['lr'].append(self.lr_scheduler.get_last_lr()[0])
+            progress_bar.close()
+
+            if self.accelerator.is_main_process: 
+                self.model.eval()
+                val_loss = 0.0
+                for val_batch in self.val_loader:
+                    val_loss += self.step(val_batch, is_training=False) # Actual validation step
+                
+                val_loss /= len(self.val_loader)
+                self.metrics_history['val_loss'].append(val_loss)
+                self.accelerator.log({"val_loss": val_loss}, step=global_step)
+                
+                logger.info(f"Epoch {epoch} | Train Loss: {avg_loss:.4f} | Val Loss: {val_loss:.4f}")
+
+                if (epoch + 1) % self.config.save_image_epochs == 0 or epoch == self.config.num_epochs - 1:
+                    dice_loss = self.generate_and_log_samples(epoch)
+                    self.metrics_history['sample_dice_loss'].append(dice_loss)
+                    self.accelerator.log({"sample_dice_loss": dice_loss}, step=global_step)
+
+                if (epoch + 1) % self.config.save_model_epochs == 0 or epoch == self.config.num_epochs - 1:
+                    self.save_checkpoint(epoch)
+
+
+def setup_logger(log_dir):
+    os.makedirs(log_dir, exist_ok=True)
+    for handler in logging.root.handlers[:]:
+        logging.root.removeHandler(handler)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.FileHandler(os.path.join(log_dir, "training.log")),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+
+def main():
+    config = TrainingConfig()
+    set_reproducibility(config.seed)
+    
+    accelerator = Accelerator(
+        mixed_precision=config.mixed_precision,
+        gradient_accumulation_steps=config.gradient_accumulation_steps,
+        log_with="tensorboard",
+        project_dir=config.exp_dir,
+    )
+    
+    if accelerator.is_main_process:
+        setup_logger(config.run_dir)
+        accelerator.init_trackers("tb_tracker_train", config=sanitize_config(asdict(config)))
+    
+    logger.info(f"Experiment directory: {config.run_dir}")
+
+    logger.info("Loading pretrained VAE...")
+    vae = AutoencoderKL.from_pretrained(config.vae_pretrained_path).to(accelerator.device)
+    vae.eval()
+    for param in vae.parameters():
+        param.requires_grad = False
+    logger.info("VAE loaded and frozen.")
+
+    dataset_config_path = os.path.join(config.data_path, "dataset_config.json")
+    if os.path.exists(dataset_config_path):
+        with open(dataset_config_path, "r") as f:
+            dataset_config = json.load(f)
+    else:
+        raise FileNotFoundError(f"Dataset config not found: {dataset_config_path}")
+
+    all_files = sorted(list(set([
+        f.replace('_fg.npy', '').replace('_mask.npy', '') 
+        for f in os.listdir(config.data_path) if f.endswith('.npy')
+    ])))
+    train_files, val_files = train_test_split(all_files, test_size=config.val_fraction, random_state=config.seed)
+
+    if accelerator.is_main_process:
+        with open(f"{config.run_dir}/train_val_split.json", "w") as f:
+            json.dump({'train_indices': train_files, 'val_indices': val_files}, f, indent=4)
+        with open(f"{config.run_dir}/grouping_rules_and_labels.json", "w") as f:
+            json.dump({'grouping_rules': GROUPING_RULES, 'new_labels': NEW_LABELS}, f, indent=4)
+        with open(f"{config.run_dir}/training_config.json", "w") as f:
+            json.dump({**asdict(config), **dataset_config}, f, indent=4)
+        with open(f"{config.vae_pretrained_path}/config.json", "r") as f:
+            vae_config = json.load(f)
+
+    train_dataset = FastDatasetDIDC(config.data_path, file_list=train_files)
+    val_dataset = FastDatasetDIDC(config.data_path, file_list=val_files)
+    
+    train_dataloader = DataLoader(train_dataset, batch_size=config.batch_size_per_gpu, shuffle=True, num_workers=config.num_workers)
+    val_dataloader = DataLoader(val_dataset, batch_size=config.batch_size_per_gpu, shuffle=False, num_workers=config.num_workers)
+
+    noise_scheduler = DDPMScheduler(num_train_timesteps=config.num_train_timesteps, beta_schedule="sigmoid")
+    
+    # parameters that depend on the VAE config
+    in_channels = vae_config['latent_channels'] * 2 if config.conditional_generation else vae_config['latent_channels'] # Handle number of channels
+    out_channels = vae_config['latent_channels']
+
+    # UNet model for noise prediction
+    model = UNet2DModel(
+        sample_size=vae_config['sample_size'], 
+        in_channels=in_channels, 
+        out_channels=out_channels,
+        layers_per_block=config.unet_layers_per_block, 
+        block_out_channels=config.unet_blocks_out_channels,
+        down_block_types=config.unet_down_block_types,
+        up_block_types=config.unet_up_block_types
+    )
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+    lr_scheduler = get_cosine_schedule_with_warmup(optimizer=optimizer, num_warmup_steps=config.lr_warmup_steps, num_training_steps=(len(train_dataloader) * config.num_epochs))
+
+    model, optimizer, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(
+        model, optimizer, train_dataloader, val_dataloader, lr_scheduler
+    )
+
+    trainer = LatentDiffusionTrainer(
+        config=config,
+        model=model,
+        vae=vae,
+        noise_scheduler=noise_scheduler,
+        optimizer=optimizer,
+        lr_scheduler=lr_scheduler,
+        train_loader=train_dataloader,
+        val_loader=val_dataloader,
+        accelerator=accelerator,
+        scale_factor=vae_config['scaling_factor']
+    )
+    
+    logger.info("Start training LDM ... ")
+    trainer.train()
+    logger.info("End training without errors.")
+
+if __name__ == '__main__':
+    main()
