@@ -69,26 +69,6 @@ class TrainingConfig:
         timestamp = datetime.now().strftime('%Y%m%d_%H%M')
         self.run_dir = os.path.join(self.exp_dir, f"{timestamp}_{self.run_name}")
 
-
-class CustomDataset(FastDatasetDIDC):
-    def __init__(self, data_path, target_size, file_list=None):
-        super().__init__(data_path, file_list)
-        self.custom_target_shape = target_size
-
-    def __getitem__(self, idx):
-        sample = super().__getitem__(idx)
-        if self.custom_target_shape is not None:
-            input_label = sample['input_label']
-            multi_class_mask = sample['multiClassMask']
-            
-            input_label = TF.resize(input_label, size=self.custom_target_shape, interpolation=TF.InterpolationMode.NEAREST)
-            multi_class_mask = TF.resize(multi_class_mask.unsqueeze(0), size=self.custom_target_shape, interpolation=TF.InterpolationMode.NEAREST).squeeze(0)
-
-            sample['input_label'] = input_label
-            sample['multiClassMask'] = multi_class_mask
-        return sample
-
-
 class LatentDiffusionTrainer:
     def __init__(self, config: TrainingConfig, model, vae, noise_scheduler, optimizer, lr_scheduler, train_loader, val_loader, accelerator, new_labels):
         self.config = config
@@ -246,7 +226,7 @@ class LatentDiffusionTrainer:
                 avg_loss += loss
                 
                 current_lr = self.lr_scheduler.get_last_lr()[0]
-                logs = {"train_loss": loss, "lr": current_lr}
+                logs = {"loss": loss, "lr": current_lr}
                 self.accelerator.log(logs, step=global_step)
 
                 progress_bar.set_postfix(**logs)
