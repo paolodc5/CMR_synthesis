@@ -27,7 +27,7 @@ logger = get_logger(__name__, log_level="INFO")
 
 @dataclass
 class TrainingConfig:
-    run_name: str = "LDM_conditional_train"
+    run_name: str = "LDM"
     data_path: str = "./DIDC_multiclass_coro_v2_prep"
     exp_dir: str = './experiments/DIDCV2/diffusion' 
     vae_pretrained_path: str = "./experiments/DIDC_VAE/20260225_1651_VAE_KL_train/checkpoint_epoch"
@@ -42,9 +42,9 @@ class TrainingConfig:
     unet_layers_per_block: int = 2
 
     # Training params
-    train_batch_size: int = 16
+    train_batch_size: int = 32
     eval_batch_size: int = 4 
-    batch_size_per_gpu: int = 8
+    batch_size_per_gpu: int = 32
     num_epochs: int = 100
     conditional_generation: bool = True
     num_train_timesteps: int = 1000
@@ -53,8 +53,8 @@ class TrainingConfig:
     lr_warmup_steps: int = 250
 
     # Logging & Saving
-    save_image_epochs: int = 1
-    save_model_epochs: int = 1
+    save_image_epochs: int = 5
+    save_model_epochs: int = 5
     num_workers: int = 8
     mixed_precision: str = "fp16" 
     notes: str = "Latent Diffusion model conditional training with custom VAE"
@@ -90,7 +90,7 @@ class CustomDataset(FastDatasetDIDC):
 
 
 class LatentDiffusionTrainer:
-    def __init__(self, config: TrainingConfig, model, vae, noise_scheduler, optimizer, lr_scheduler, train_loader, val_loader, accelerator, scale_factor, new_labels):
+    def __init__(self, config: TrainingConfig, model, vae, noise_scheduler, optimizer, lr_scheduler, train_loader, val_loader, accelerator, new_labels):
         self.config = config
         self.model = model
         self.vae = vae
@@ -100,8 +100,9 @@ class LatentDiffusionTrainer:
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.accelerator = accelerator
-        self.scale_factor = scale_factor
+        self.scale_factor = vae.config.scaling_factor
         self.new_labels = new_labels
+        self.latent_channels = vae.config.latent_channels
 
         self.metrics_history = {
             'train_loss': [], 'val_loss': [], 'sample_dice_loss': [], 'lr': []
@@ -130,16 +131,15 @@ class LatentDiffusionTrainer:
         clean_images = F.one_hot(clean_images.long(), num_classes=self.config.num_input_classes).permute(0, 3, 1, 2).float() 
         fg_masks = fg_masks.float() 
 
-        B, _, H, W = fg_masks.shape
-        
+        # Map original foreground masks to the multi tissue label space expected by the VAE
+        B, _, H, W = fg_masks.shape        
         mapped_fg_masks = torch.zeros(
             (B, self.config.num_input_classes, H, W), 
             device=fg_masks.device, 
             dtype=fg_masks.dtype
         )
 
-        fg_indices = self.new_labels.index('Background') 
-        
+        fg_indices = [self.new_labels.index(label) for label in ['Background', 'LV_blood_pool', 'LV_Myocardium', 'RV_blood_pool_myocardium']]
         mapped_fg_masks[:, fg_indices, :, :] = fg_masks
 
 
@@ -185,7 +185,7 @@ class LatentDiffusionTrainer:
         actual_batch_size = enc_fg.size(0)
 
         # Noise generation (latent shape)
-        noise_shape = (actual_batch_size, self.config.latent_channels, enc_fg.shape[2], enc_fg.shape[3])
+        noise_shape = (actual_batch_size, self.latent_channels, enc_fg.shape[2], enc_fg.shape[3])
         generator = torch.Generator(device=self.accelerator.device).manual_seed(self.config.seed)
         z_t = torch.randn(noise_shape, generator=generator, device=self.accelerator.device)
 
@@ -261,9 +261,9 @@ class LatentDiffusionTrainer:
             if self.accelerator.is_main_process: 
                 self.model.eval()
                 val_loss = 0.0
-                for val_batch in self.val_loader:
+                for val_step, val_batch in enumerate(self.val_loader):
                     val_loss += self.step(val_batch, is_training=False) # Actual validation step
-                
+
                 val_loss /= len(self.val_loader)
                 self.metrics_history['val_loss'].append(val_loss)
                 self.accelerator.log({"val_loss": val_loss}, step=global_step)
@@ -300,12 +300,12 @@ def main():
         mixed_precision=config.mixed_precision,
         gradient_accumulation_steps=config.gradient_accumulation_steps,
         log_with="tensorboard",
-        project_dir=config.exp_dir,
+        project_dir=config.run_dir,
     )
     
     if accelerator.is_main_process:
         setup_logger(config.run_dir)
-        accelerator.init_trackers("tb_tracker_train", config=sanitize_config(asdict(config)))
+        accelerator.init_trackers(f"tb_tracker_train", config=sanitize_config(asdict(config)))
     
     logger.info(f"Experiment directory: {config.run_dir}")
 
@@ -336,8 +336,6 @@ def main():
             json.dump({'grouping_rules': GROUPING_RULES, 'new_labels': NEW_LABELS}, f, indent=4)
         with open(f"{config.run_dir}/training_config.json", "w") as f:
             json.dump({**asdict(config), **dataset_config}, f, indent=4)
-        with open(f"{config.vae_pretrained_path}/config.json", "r") as f:
-            vae_config = json.load(f)
 
     train_dataset = FastDatasetDIDC(config.data_path, file_list=train_files)
     val_dataset = FastDatasetDIDC(config.data_path, file_list=val_files)
@@ -348,12 +346,12 @@ def main():
     noise_scheduler = DDPMScheduler(num_train_timesteps=config.num_train_timesteps, beta_schedule="sigmoid")
     
     # parameters that depend on the VAE config
-    in_channels = vae_config['latent_channels'] * 2 if config.conditional_generation else vae_config['latent_channels'] # Handle number of channels
-    out_channels = vae_config['latent_channels']
+    in_channels = vae.config.latent_channels * 2 if config.conditional_generation else vae.config.latent_channels # Handle number of channels
+    out_channels = vae.config.latent_channels
 
     # UNet model for noise prediction
     model = UNet2DModel(
-        sample_size=vae_config['sample_size'], 
+        sample_size=vae.config.sample_size, 
         in_channels=in_channels, 
         out_channels=out_channels,
         layers_per_block=config.unet_layers_per_block, 
@@ -379,7 +377,7 @@ def main():
         train_loader=train_dataloader,
         val_loader=val_dataloader,
         accelerator=accelerator,
-        scale_factor=vae_config['scaling_factor']
+        new_labels=dataset_config['new_labels_used']
     )
     
     logger.info("Start training LDM ... ")
@@ -387,4 +385,8 @@ def main():
     logger.info("End training without errors.")
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except Exception as e:
+        logger.exception("An error occurred during training.")
+        sys.exit(1)
