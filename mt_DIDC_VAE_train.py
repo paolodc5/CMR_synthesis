@@ -21,40 +21,39 @@ from utils import multiclass_dice_loss, set_reproducibility, sanitize_config, sa
 @dataclass
 class VAETrainingConfig:
     run_name: str = "VAE_KL_train"
-    data_path: str = "./DIDC_multiclass_coro_v2_prep_old"
+    data_path: str = "./DIDC_multiclass_coro_v2_prep"
     num_workers: int = 8
-    target_size: int = 384
     val_fraction: float = 0.2
     num_input_classes: int = 22
     train_batch_size: int = 16
     eval_batch_size: int = 4  
-    batch_size_per_gpu: int = 4
+    batch_size_per_gpu: int = 8
     num_epochs: int = 170
     
     latent_channels: int = 8 # Compresses the input mask (22 channels)
     kl_weight: float = 1e-5  # weight for KL divergence in the loss function
     layers_per_block: int = 2
-    block_out_channels: tuple = (64, 128, 256)
+    block_out_channels: tuple = (64, 128, 256, 256)
     down_block_types: tuple = ("DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D")
     up_block_types: tuple = ("UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D")
     
     num_fg_channels: int = 4
 
-    sensitive_labels = ['Background', 'LV_Myocardium', 'LV_blood_pool', 'RV_blood_pool_myocardium', 'Lungs']
-    class_weight_sensitive = 10.0
+    sensitive_labels: tuple = ('Background', 'LV_Myocardium', 'LV_blood_pool', 'RV_blood_pool_myocardium', 'Lungs')
+    class_weight_sensitive: float = 10.0 # Active only if sensitive_labels is not None
 
     num_gpus: int = torch.cuda.device_count() if torch.cuda.is_available() else 1
     learning_rate: float = 1e-4
-    lr_warmup_steps: int = 250
+    lr_warmup_steps: int = 50
     save_image_epochs: int = 1
     save_model_epochs: int = 1
     mixed_precision: str = "fp16"
     seed: int = 187
-    notes: str = "VAE with KL divergence loss, Targeting 4 foreground classes with remapping and thresholding. NEW dataset coroV2"
+    notes: str = "VAE training WITH weighted classes, 8x spatial compression, almost 3x compression in channels. KL, reconstruction loss only. "
     gradient_accumulation_steps: int = 1
     exp_dir = './experiments/DIDC_VAE' 
     adv_train: bool = False # Whether to use adversarial training with a discriminator (PatchGAN) alongside the VAE. 
-    disc_start_step: int = 150
+    disc_start_step: int = 100 # Number of steps to train the VAE alone before starting adversarial training with the discriminator. (active only if adv_train=True)
 
     def __post_init__(self):
         self.gradient_accumulation_steps = max(1, self.train_batch_size // (self.batch_size_per_gpu * self.num_gpus))
@@ -129,7 +128,7 @@ def compute_perceptual_loss(discr_real, discr_fake, criterion_L1):
 
 def train_vae_adv_step(batch, model, discriminator, num_classes, accelerator, 
                        opt_vae, opt_disc, global_step, 
-                       disc_start_step=10000, kl_weight=1e-6, is_training=True, class_weights=None):
+                       disc_start_step=20, kl_weight=1e-6, is_training=True, class_weights=None):
     
     target_classes = batch['multiClassMask'].long()
     if target_classes.dim() == 4: target_classes = target_classes.squeeze(1)
@@ -282,8 +281,8 @@ def train_loop(config, model, optimizer, train_dataloader, val_dataloader, lr_sc
         'val_d_weight': [],
     }
 
-    model, optimizer, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, val_dataloader, lr_scheduler
+    model, optimizer, train_dataloader, val_dataloader, lr_scheduler, discriminator = accelerator.prepare(
+        model, optimizer, train_dataloader, val_dataloader, lr_scheduler, discriminator
     )
 
     fixed_sample_batch = next(iter(val_dataloader))
@@ -298,13 +297,29 @@ def train_loop(config, model, optimizer, train_dataloader, val_dataloader, lr_sc
         for step, batch in enumerate(train_dataloader):
             if adv_train:
                 total_loss, recon_loss, kl_loss, dice_loss, d_loss, d_weight = train_vae_adv_step(
-                    batch, model, discriminator, config.num_input_classes, accelerator, 
-                    optimizer, opt_disc, global_step, disc_start_step=config.disc_start_step, kl_weight=config.kl_weight
+                    batch, 
+                    model, 
+                    discriminator, 
+                    config.num_input_classes, 
+                    accelerator, 
+                    optimizer, 
+                    opt_disc, 
+                    global_step, 
+                    disc_start_step=config.disc_start_step, 
+                    kl_weight=config.kl_weight, 
+                    class_weights=class_weights
                 )
             else:
-                total_loss, recon_loss, kl_loss, dice_loss, d_loss, d_weight = train_val_step(
-                    batch, model, config.num_input_classes, accelerator, 
-                    optimizer=optimizer, lr_scheduler=lr_scheduler, is_training=True, kl_weight=config.kl_weight
+                total_loss, recon_loss, kl_loss, dice_loss = train_val_step(
+                    batch, 
+                    model, 
+                    config.num_input_classes, 
+                    accelerator, 
+                    optimizer=optimizer, 
+                    lr_scheduler=lr_scheduler, 
+                    is_training=True, 
+                    kl_weight=config.kl_weight, 
+                    class_weights=class_weights
                 )
             
             logs = {"Loss/Total": total_loss, "Loss/Recon": recon_loss, "Loss/KL": kl_loss, "Loss/Dice": dice_loss, "Loss/Discriminator": d_loss, "Weight/Discriminator": d_weight, "lr": lr_scheduler.get_last_lr()[0]}
@@ -318,7 +333,7 @@ def train_loop(config, model, optimizer, train_dataloader, val_dataloader, lr_sc
             metrics_hystory['train_d_weight'].append(d_weight)
             metrics_hystory['current_epoch'] = epoch
 
-            progress_bar.set_postfix(loss=total_loss, recon=recon_loss)
+            progress_bar.set_postfix(loss=total_loss, recon=recon_loss, kl=kl_loss, dice=dice_loss, d_loss=d_loss, d_weight=d_weight, lr=lr_scheduler.get_last_lr()[0])
             progress_bar.update(1)
             global_step += 1
 
@@ -329,14 +344,28 @@ def train_loop(config, model, optimizer, train_dataloader, val_dataloader, lr_sc
             for val_batch in val_dataloader:
                 if adv_train:
                     v_tot, v_rec, v_kl, v_dice, v_d_loss, v_d_weight = train_vae_adv_step(
-                        val_batch, model, discriminator, config.num_input_classes, accelerator, 
-                        opt_vae=None, opt_disc=None, global_step=global_step, 
-                        disc_start_step=config.disc_start_step, kl_weight=config.kl_weight
+                        val_batch, 
+                        model, 
+                        discriminator, 
+                        config.num_input_classes, 
+                        accelerator, 
+                        opt_vae=None, 
+                        opt_disc=None, 
+                        global_step=global_step, 
+                        disc_start_step=config.disc_start_step, 
+                        kl_weight=config.kl_weight, 
+                        is_training=False, 
+                        class_weights=class_weights
                     )
                 else:
                     v_tot, v_rec, v_kl, v_dice, v_d_loss, v_d_weight = train_val_step(
-                        val_batch, model, config.num_input_classes, accelerator, 
-                        is_training=False, kl_weight=config.kl_weight
+                        val_batch, 
+                        model, 
+                        config.num_input_classes, 
+                        accelerator, 
+                        is_training=False, 
+                        kl_weight=config.kl_weight, 
+                        class_weights=class_weights
                     )
                 val_loss += v_tot
                 val_recon += v_rec
@@ -353,7 +382,7 @@ def train_loop(config, model, optimizer, train_dataloader, val_dataloader, lr_sc
             val_d_weight /= len(val_dataloader)
             
             accelerator.log({"Val_Loss/Total": val_loss, "Val_Loss/Recon": val_recon, "Val_Loss/KL": val_kl, "Val_Loss/Dice": val_dice, "Val_Loss/Discriminator": val_d_loss, "Val_Weight/Discriminator": val_d_weight}, step=global_step)
-            print(f"Epoch {epoch} | Val Recon Loss: {val_recon:.4f} | Val KL Loss: {val_kl:.4f} | Val Dice Loss: {val_dice:.4f} | Val D Loss: {val_d_loss:.4f}")
+            print(f"Epoch {epoch} | Val Recon Loss: {val_recon:.4f} | Val KL Loss: {val_kl:.4f} | Val Dice Loss: {val_dice:.4f} | Val D Loss: {val_d_loss:.4f} | Val D Weight: {val_d_weight:.4f}")
 
             metrics_hystory['val_loss'].append(val_loss)
             metrics_hystory['val_recon_loss'].append(val_recon)
@@ -448,8 +477,11 @@ def main():
                     class_weights.append(1.0)
     else:
         class_weights = None
-        
+
     print("Class weights for training:", class_weights)
+    if class_weights:
+        with open(os.path.join(config.exp_dir, "class_weights.json"), "w") as f:
+            json.dump({label: weight for label, weight in zip(dataset_config["new_labels_used"], class_weights)}, f, indent=4)
 
     train_loop(config, 
                model, 
