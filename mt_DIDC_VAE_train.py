@@ -20,7 +20,7 @@ from utils import multiclass_dice_loss, set_reproducibility, sanitize_config, sa
 
 @dataclass
 class VAETrainingConfig:
-    run_name: str = "VAE_KL_train_fg_test"
+    run_name: str = "VAE_KL_train_fg"
     data_path: str = "./DIDC_multiclass_coro_v2_prep"
     num_workers: int = 8
     val_fraction: float = 0.2
@@ -357,9 +357,6 @@ def train_loop(config, model, optimizer, train_dataloader, val_dataloader, lr_sc
             progress_bar.update(1)
             global_step += 1
 
-            if step>10 and accelerator.is_main_process:
-                break # just a quick test to check that the training loop runs, remove this in real training
-
         if accelerator.is_main_process:
             model.eval()
             val_loss, val_recon, val_kl, val_dice, val_d_loss, val_d_weight = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
@@ -400,9 +397,6 @@ def train_loop(config, model, optimizer, train_dataloader, val_dataloader, lr_sc
                 val_dice += v_dice
                 val_d_loss += v_d_loss
                 val_d_weight += v_d_weight
-
-                if val_step>10 and accelerator.is_main_process:
-                    break # just a quick test to check that the validation loop runs, remove this in real validation
                 
             val_loss /= len(val_dataloader)
             val_recon /= len(val_dataloader)
