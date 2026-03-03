@@ -20,25 +20,25 @@ from utils import multiclass_dice_loss, set_reproducibility, sanitize_config, sa
 
 @dataclass
 class VAETrainingConfig:
-    run_name: str = "VAE_KL_train_no_adv"
+    run_name: str = "VAE_KL_train_fg_test"
     data_path: str = "./DIDC_multiclass_coro_v2_prep"
     num_workers: int = 8
     val_fraction: float = 0.2
-    num_input_classes: int = 22
     train_batch_size: int = 16
     eval_batch_size: int = 4  
     batch_size_per_gpu: int = 8
     num_epochs: int = 170
-    
-    latent_channels: int = 8 # Compresses the input mask (22 channels)
+
+    use_fg: bool = False # Whether to use the foreground masks (input_label) as targets instead of the multiClassMask. 
+    # If True, the model will be trained to reconstruct the foreground masks directly, which have 4 channels. If False, the model will be trained to reconstruct the multiClassMask with 22 channels.
+
+    latent_channels: int = 2 # Compresses the input
     kl_weight: float = 1e-5  # weight for KL divergence in the loss function
     layers_per_block: int = 2
     block_out_channels: tuple = (64, 128, 256, 256)
     down_block_types: tuple = ("DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D")
     up_block_types: tuple = ("UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D")
     
-    num_fg_channels: int = 4
-
     sensitive_labels: tuple = ('Background', 'LV_Myocardium', 'LV_blood_pool', 'RV_blood_pool_myocardium', 'Lungs')
     class_weight_sensitive: float = 10.0 # Active only if sensitive_labels is not None
 
@@ -49,15 +49,16 @@ class VAETrainingConfig:
     save_model_epochs: int = 1
     mixed_precision: str = "fp16"
     seed: int = 187
-    notes: str = "VAE training WITH weighted classes, 8x spatial compression, almost 3x compression in channels. KL, reconstruction loss only. "
+    notes: str = "VAE training FOREGROUND, 8x spatial compression. KL, reconstruction loss only. "
     gradient_accumulation_steps: int = 1
     exp_dir = './experiments/DIDC_VAE' 
-    adv_train: bool = False # Whether to use adversarial training with a discriminator (PatchGAN) alongside the VAE. 
+    adv_train: bool = True # Whether to use adversarial training with a discriminator (PatchGAN) alongside the VAE. 
     disc_start_step: int = 100 # Number of steps to train the VAE alone before starting adversarial training with the discriminator. (active only if adv_train=True)
 
     def __post_init__(self):
         self.gradient_accumulation_steps = max(1, self.train_batch_size // (self.batch_size_per_gpu * self.num_gpus))
         self.exp_dir = os.path.join(self.exp_dir, f"{datetime.now().strftime('%Y%m%d_%H%M')}_{self.run_name}")
+        self.sensitive_labels = self.sensitive_labels if not self.use_fg else None # If using foreground masks, we don't apply class weighting since the classes are different and already focused on the foreground
 
 def calculate_adaptive_weight(recon_loss, g_loss, last_layer, disc_weight_max=0.75):
     recon_grads = torch.autograd.grad(recon_loss, last_layer, retain_graph=True)[0]
@@ -67,14 +68,20 @@ def calculate_adaptive_weight(recon_loss, g_loss, last_layer, disc_weight_max=0.
     d_weight = torch.clamp(d_weight, 0.0, disc_weight_max).detach()
     return d_weight
 
-def train_val_step(batch, model, num_classes, accelerator, optimizer=None, lr_scheduler=None, is_training=True, kl_weight=1e-5, class_weights=None):
+def train_val_step(batch, model, num_classes, accelerator, optimizer=None, lr_scheduler=None, is_training=True, kl_weight=1e-5, class_weights=None, use_fg=False):
     assert not (is_training and optimizer is None), "Optimizer must be provided for training step"
 
-    target_classes = batch['multiClassMask'].long() # Shape: (B, H, W)
-    if target_classes.dim() == 4:
-        target_classes = target_classes.squeeze(1)
+    if not use_fg:
+        target_classes = batch['multiClassMask'].long() # Shape: (B, H, W)
+        if target_classes.dim() == 4:
+            target_classes = target_classes.squeeze(1)
+        clean_images = F.one_hot(target_classes, num_classes=num_classes).permute(0, 3, 1, 2).float() 
 
-    clean_images = F.one_hot(target_classes, num_classes=num_classes).permute(0, 3, 1, 2).float() 
+    else:
+        target_classes = batch['input_label'] # Shape: (B, num_fg_channels, H, W)
+        assert target_classes.dim() == 4, "Expected input_label to have shape (B, num_fg_channels, H, W)"
+        clean_images = target_classes.float() # already one-hot encoded in the input_label, just convert to float
+
     clean_images = clean_images * 2.0 - 1.0 
 
     with torch.set_grad_enabled(is_training):
@@ -88,7 +95,7 @@ def train_val_step(batch, model, num_classes, accelerator, optimizer=None, lr_sc
             weights_tensor = None
 
         recon_loss = F.cross_entropy(reconstructed_logits, target_classes, weight=weights_tensor)
-        dice_loss = multiclass_dice_loss(reconstructed_logits, target_classes)
+        dice_loss = multiclass_dice_loss(reconstructed_logits, target_classes.argmax(dim=1) if use_fg else target_classes)
         kl_loss = posterior.kl().mean()
         loss = recon_loss + kl_weight * kl_loss
 
@@ -128,12 +135,17 @@ def compute_perceptual_loss(discr_real, discr_fake, criterion_L1):
 
 def train_vae_adv_step(batch, model, discriminator, num_classes, accelerator, 
                        opt_vae, opt_disc, global_step, 
-                       disc_start_step=20, kl_weight=1e-6, is_training=True, class_weights=None):
+                       disc_start_step=20, kl_weight=1e-6, is_training=True, class_weights=None, use_fg=False):
     
-    target_classes = batch['multiClassMask'].long()
-    if target_classes.dim() == 4: target_classes = target_classes.squeeze(1)
+    if use_fg:
+        target_classes = batch['input_label'] # Shape: (B, num_fg_channels, H, W)
+        assert target_classes.dim() == 4, "Expected input_label to have shape (B, num_fg_channels, H, W)"
+        clean_images = target_classes.float() # already one-hot encoded in the input_label, just convert to float
+    else:
+        target_classes = batch['multiClassMask'].long()
+        if target_classes.dim() == 4: target_classes = target_classes.squeeze(1)
+        clean_images = F.one_hot(target_classes, num_classes=num_classes).permute(0, 3, 1, 2).float()
 
-    clean_images = F.one_hot(target_classes, num_classes=num_classes).permute(0, 3, 1, 2).float()
     clean_images = clean_images * 2.0 - 1.0 # SCALING IMPORTANT
 
     with torch.set_grad_enabled(is_training):
@@ -147,7 +159,7 @@ def train_vae_adv_step(batch, model, discriminator, num_classes, accelerator,
             weights_tensor = None
 
         recon_loss = F.cross_entropy(reconstructed_logits, target_classes, weight=weights_tensor)
-        dice_loss = multiclass_dice_loss(reconstructed_logits, target_classes)
+        dice_loss = multiclass_dice_loss(reconstructed_logits, target_classes.argmax(dim=1) if use_fg else target_classes)
         kl_loss = posterior.kl().mean()
     
         real_features = discriminator(clean_images)
@@ -205,17 +217,23 @@ def train_vae_adv_step(batch, model, discriminator, num_classes, accelerator,
 
     return total_vae_loss.item(), recon_loss.item(), kl_loss.item(), dice_loss.item(), d_loss.item(), d_weight_value
 
-def sample_and_save_reconstructions(model, config, epoch, num_classes, accelerator, val_batch):
+def sample_and_save_reconstructions(model, config, epoch, num_classes, accelerator, val_batch, use_fg=False):
     """
     Pass a real batch for visualization
     """
     model.eval()
     
-    gt_classes = val_batch['multiClassMask'].long()
-    if gt_classes.dim() == 4:
-        gt_classes = gt_classes.squeeze(1)
-    
-    clean_images_oh = F.one_hot(gt_classes, num_classes=num_classes).permute(0, 3, 1, 2).float() 
+    if not use_fg:
+        gt_classes = val_batch['multiClassMask'].long()
+        if gt_classes.dim() == 4:
+            gt_classes = gt_classes.squeeze(1)
+        
+        clean_images_oh = F.one_hot(gt_classes, num_classes=num_classes).permute(0, 3, 1, 2).float() 
+    else:
+        gt_classes = val_batch['input_label'] # Shape: (B, num_fg_channels, H, W)
+        assert gt_classes.dim() == 4, "Expected input_label to have shape (B, num_fg_channels, H, W)"
+        clean_images_oh = gt_classes.float() # already one-hot encoded in the input_label, just convert to float
+
     clean_images_oh = (clean_images_oh * 2.0 - 1.0).to(accelerator.device)
 
     with torch.no_grad():
@@ -225,7 +243,7 @@ def sample_and_save_reconstructions(model, config, epoch, num_classes, accelerat
             
     # Tensors for tensorboard logging 
     reconstructed_classes_tensor = torch.argmax(reconstructed_logits, dim=1).cpu()
-    gt_classes_tensor = gt_classes.cpu()
+    gt_classes_tensor = gt_classes.cpu() if not use_fg else torch.argmax(gt_classes, dim=1).cpu() # if using foreground masks, we take the argmax to get class indices for visualization
 
     gt_tb = gt_classes_tensor.unsqueeze(1).float() / (num_classes - 1)
     recon_tb = reconstructed_classes_tensor.unsqueeze(1).float() / (num_classes - 1)
@@ -252,7 +270,7 @@ def sample_and_save_reconstructions(model, config, epoch, num_classes, accelerat
         img = Image.fromarray(combined_img, mode="L")
         img.save(os.path.join(image_dir, f"epoch_{epoch:04d}_sample_{i:02d}_(GT_vs_Recon).png"))
 
-def train_loop(config, model, optimizer, train_dataloader, val_dataloader, lr_scheduler, adv_train=False, discriminator=None, opt_disc=None, class_weights=None):
+def train_loop(config, model, optimizer, train_dataloader, val_dataloader, lr_scheduler, adv_train=False, discriminator=None, opt_disc=None, class_weights=None, num_classes=None):
     assert not adv_train or (adv_train and discriminator is not None and opt_disc is not None), "Discriminator and its optimizer must be provided for adversarial training"
     
     accelerator = Accelerator(
@@ -300,26 +318,28 @@ def train_loop(config, model, optimizer, train_dataloader, val_dataloader, lr_sc
                     batch, 
                     model, 
                     discriminator, 
-                    config.num_input_classes, 
+                    num_classes, 
                     accelerator, 
                     optimizer, 
                     opt_disc, 
                     global_step, 
                     disc_start_step=config.disc_start_step, 
                     kl_weight=config.kl_weight, 
-                    class_weights=class_weights
+                    class_weights=class_weights,
+                    use_fg=config.use_fg
                 )
             else:
                 total_loss, recon_loss, kl_loss, dice_loss = train_val_step(
                     batch, 
                     model, 
-                    config.num_input_classes, 
+                    num_classes, 
                     accelerator, 
                     optimizer=optimizer, 
                     lr_scheduler=lr_scheduler, 
                     is_training=True, 
                     kl_weight=config.kl_weight, 
-                    class_weights=class_weights
+                    class_weights=class_weights,
+                    use_fg=config.use_fg
                 )
             
             logs = {"Loss/Total": total_loss, "Loss/Recon": recon_loss, "Loss/KL": kl_loss, "Loss/Dice": dice_loss, "Loss/Discriminator": d_loss, "Weight/Discriminator": d_weight, "lr": lr_scheduler.get_last_lr()[0]}
@@ -337,6 +357,9 @@ def train_loop(config, model, optimizer, train_dataloader, val_dataloader, lr_sc
             progress_bar.update(1)
             global_step += 1
 
+            if step>10 and accelerator.is_main_process:
+                break # just a quick test to check that the training loop runs, remove this in real training
+
         if accelerator.is_main_process:
             model.eval()
             val_loss, val_recon, val_kl, val_dice, val_d_loss, val_d_weight = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
@@ -347,7 +370,7 @@ def train_loop(config, model, optimizer, train_dataloader, val_dataloader, lr_sc
                         val_batch, 
                         model, 
                         discriminator, 
-                        config.num_input_classes, 
+                        num_classes, 
                         accelerator, 
                         opt_vae=None, 
                         opt_disc=None, 
@@ -355,17 +378,19 @@ def train_loop(config, model, optimizer, train_dataloader, val_dataloader, lr_sc
                         disc_start_step=config.disc_start_step, 
                         kl_weight=config.kl_weight, 
                         is_training=False, 
-                        class_weights=class_weights
+                        class_weights=class_weights,
+                        use_fg=config.use_fg
                     )
                 else:
                     v_tot, v_rec, v_kl, v_dice = train_val_step(
                         val_batch, 
                         model, 
-                        config.num_input_classes, 
+                        num_classes, 
                         accelerator, 
                         is_training=False, 
                         kl_weight=config.kl_weight, 
-                        class_weights=class_weights
+                        class_weights=class_weights,
+                        use_fg=config.use_fg
                     )
                     v_d_loss, v_d_weight = 0.0, 0.0
 
@@ -375,6 +400,9 @@ def train_loop(config, model, optimizer, train_dataloader, val_dataloader, lr_sc
                 val_dice += v_dice
                 val_d_loss += v_d_loss
                 val_d_weight += v_d_weight
+
+                if val_step>10 and accelerator.is_main_process:
+                    break # just a quick test to check that the validation loop runs, remove this in real validation
                 
             val_loss /= len(val_dataloader)
             val_recon /= len(val_dataloader)
@@ -396,7 +424,7 @@ def train_loop(config, model, optimizer, train_dataloader, val_dataloader, lr_sc
             unwrapped_model = accelerator.unwrap_model(model)
 
             if (epoch + 1) % config.save_image_epochs == 0 or epoch == config.num_epochs - 1:
-                sample_and_save_reconstructions(unwrapped_model, config, epoch, config.num_input_classes, accelerator, fixed_sample_batch)
+                sample_and_save_reconstructions(unwrapped_model, config, epoch, num_classes, accelerator, fixed_sample_batch, use_fg=config.use_fg)
 
             if (epoch + 1) % config.save_model_epochs == 0 or epoch == config.num_epochs - 1:
                 checkpoint_path = os.path.join(config.exp_dir, f"checkpoint_epoch")
@@ -448,6 +476,8 @@ def main():
     with open (f"{config.exp_dir}/training_config.json", "w") as f:
         json.dump({**sanitize_config(asdict(config)), **sanitize_config(dataset_config)}, f, indent=4)
 
+    num_classes = len(dataset_config['new_labels_used']) if not config.use_fg else dataset_config['num_fg_classes_preprocessing']
+
     train_dataset = FastDatasetDIDC(config.data_path, file_list=train_files)
     val_dataset =  FastDatasetDIDC(config.data_path, file_list=val_files)
     
@@ -455,8 +485,8 @@ def main():
     val_dataloader = DataLoader(val_dataset, batch_size=config.batch_size_per_gpu, shuffle=False, num_workers=config.num_workers)
     
     model = AutoencoderKL(
-        in_channels=config.num_input_classes,      
-        out_channels=config.num_input_classes,     
+        in_channels=num_classes,      
+        out_channels=num_classes,     
         latent_channels=config.latent_channels,    
         down_block_types=config.down_block_types,
         up_block_types=config.up_block_types,
@@ -464,7 +494,7 @@ def main():
         layers_per_block=config.layers_per_block,
     )
 
-    discr_model = DiscriminatorPatchGAN(in_ch=config.num_input_classes, base_ch=64, n_layers=3)
+    discr_model = DiscriminatorPatchGAN(in_ch=num_classes, base_ch=64, n_layers=3)
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
     optimizer_disc = torch.optim.AdamW(discr_model.parameters(), lr=config.learning_rate) # Placeholder, will be used if adv_train=True
@@ -494,7 +524,8 @@ def main():
                discriminator=discr_model, 
                opt_disc=optimizer_disc, 
                adv_train=config.adv_train,
-               class_weights=class_weights
+               class_weights=class_weights,
+               num_classes=num_classes
                )
 
     log_file.close()
