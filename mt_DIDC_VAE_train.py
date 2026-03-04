@@ -29,7 +29,7 @@ class VAETrainingConfig:
     batch_size_per_gpu: int = 8
     num_epochs: int = 170
 
-    use_fg: bool = False # Whether to use the foreground masks (input_label) as targets instead of the multiClassMask. 
+    use_fg: bool = True # Whether to use the foreground masks (input_label) as targets instead of the multiClassMask. 
     # If True, the model will be trained to reconstruct the foreground masks directly, which have 4 channels. If False, the model will be trained to reconstruct the multiClassMask with 22 channels.
 
     latent_channels: int = 2 # Compresses the input
@@ -52,13 +52,15 @@ class VAETrainingConfig:
     notes: str = "VAE training FOREGROUND, 8x spatial compression. KL, reconstruction loss only. "
     gradient_accumulation_steps: int = 1
     exp_dir = './experiments/DIDC_VAE' 
-    adv_train: bool = True # Whether to use adversarial training with a discriminator (PatchGAN) alongside the VAE. 
+    adv_train: bool = False # Whether to use adversarial training with a discriminator (PatchGAN) alongside the VAE. 
     disc_start_step: int = 100 # Number of steps to train the VAE alone before starting adversarial training with the discriminator. (active only if adv_train=True)
+    compression_factor: int = 0
 
     def __post_init__(self):
         self.gradient_accumulation_steps = max(1, self.train_batch_size // (self.batch_size_per_gpu * self.num_gpus))
         self.exp_dir = os.path.join(self.exp_dir, f"{datetime.now().strftime('%Y%m%d_%H%M')}_{self.run_name}")
         self.sensitive_labels = self.sensitive_labels if not self.use_fg else None # If using foreground masks, we don't apply class weighting since the classes are different and already focused on the foreground
+        self.compression_factor = 2 ** (len(self.down_block_types) - 1) # Calculate the total spatial compression factor based on the number of down blocks
 
 def calculate_adaptive_weight(recon_loss, g_loss, last_layer, disc_weight_max=0.75):
     recon_grads = torch.autograd.grad(recon_loss, last_layer, retain_graph=True)[0]

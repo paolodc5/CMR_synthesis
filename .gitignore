@@ -6,6 +6,7 @@ old/
 .venv/
 __pycache__/
 DIDC_multiclass_coro_v2*/
+test/
 
 .DS_Store
 
