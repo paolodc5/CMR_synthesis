@@ -4,6 +4,8 @@ import torch.nn.functional as F
 import torch
 import random
 import numpy as np
+import logging
+import sys
 
 
 def load_all_data(folder_path):
@@ -174,6 +176,31 @@ def sanitize_config(config_dict):
 
     return sanitized_config
 
+def setup_logger(log_dir):
+    os.makedirs(log_dir, exist_ok=True)
+    for handler in logging.root.handlers[:]:
+        logging.root.removeHandler(handler)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.FileHandler(os.path.join(log_dir, "training.log")),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+
+def load_original_labels(data_path):
+    original_labels = []
+
+    if os.path.isfile(data_path + '/tissue_list.txt'):
+        with open (data_path + '/tissue_list.txt', 'r') as f:
+            for i, line in enumerate(f):
+                if i > 1:
+                    line = line.strip().split()[-1]
+                    original_labels.append(line)
+        return ['Background'] + original_labels
+    else:
+        raise FileNotFoundError(f"Original labels file not found at {data_path + '/tissue_list.txt'}")
 
 if __name__ == "__main__":
     # test multiclass_dice_loss with dummy data

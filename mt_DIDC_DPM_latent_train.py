@@ -21,7 +21,7 @@ from diffusers import DDPMScheduler, UNet2DModel, AutoencoderKL, get_cosine_sche
 # Import custom (assumendo che esistano nel tuo environment)
 from datasets import FastDatasetDIDC
 from mt_DIDC_config import GROUPING_RULES, NEW_LABELS
-from utils import set_reproducibility, sanitize_config, multiclass_dice_loss
+from utils import set_reproducibility, sanitize_config, multiclass_dice_loss, setup_logger
 
 logger = get_logger(__name__, log_level="INFO")
 
@@ -269,20 +269,6 @@ class LatentDiffusionTrainer:
 
                 if (epoch + 1) % self.config.save_model_epochs == 0 or epoch == self.config.num_epochs - 1:
                     self.save_checkpoint(epoch)
-
-
-def setup_logger(log_dir):
-    os.makedirs(log_dir, exist_ok=True)
-    for handler in logging.root.handlers[:]:
-        logging.root.removeHandler(handler)
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[
-            logging.FileHandler(os.path.join(log_dir, "training.log")),
-            logging.StreamHandler(sys.stdout)
-        ]
-    )
 
 def main():
     config = TrainingConfig()

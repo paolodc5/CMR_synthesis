@@ -57,6 +57,51 @@ GROUPING_RULES = {
     "Spinal_cord": "Spinal_cord",
 }
 
+# ITIS database values for reference
+PROPERTY_KEY = {
+    "blood": [80.43, 1414.8, 308.5],  # (ITIS)
+    "bone": [15.30, 288.0, 165.0], # (ITIS yellow marrow)
+    "muscle": [76.21, 981.5, 36.0], # (ITIS)
+    "fat": [100., 288.0, 165.0],  # (Gold et al. 2012, subcutaneous fat)
+    "heart_muscle": [79.47, 1026.3, 42.0],  # (ITIS)
+    "liver": [76.33, 661.5, 56.8],  # (ITIS)
+    "lungs": [27.20, 1196., 6.3],  # (ITIS, T1 is from Dietrich et al 2016)
+    "pancreas": [73.18, 584.0, 46.0], # (ITIS)
+    "spleen": [79.34, 1057.0, 79.0], # (ITIS)
+    "kidney": [80.50, 828.0,  71.0], # (ITIS)
+    "spinal_cord": [71.84, 745.0, 74.0], # (ITIS)
+    "skin": [65.19, 900.0, 20.0], # (ITIS, T1 and T2 are estimated from derma values in Richard et al, 1991)
+    "others": [71.0, 250.0, 20.0], # from Buoso
+    "background_air": [0.01, 750.0, 60.0], # from Buoso
+    "trachea": [60.00, 1045.5, 37.3]
+}
+# "cartilage": [71.77, 1045.5, 37.3], # (ITIS)
+
+LABEL2LABEL = {
+    "Aorta": "blood",
+    "Background": "background_air",
+    "Blood_vessels": "blood",
+    "Bones_and_cartilage": "bone",
+    "Esophagus_and_trachea": "trachea",
+    "Fat": "fat",
+    "Gallbladder": "others",
+    "Heart_generic": "heart_muscle",
+    "Intestine": "others",
+    "Kidneys": "kidney",
+    "LV_Myocardium": "heart_muscle",
+    "LV_blood_pool": "blood",
+    "Liver": "liver",
+    "Lungs": "lungs",
+    "Muscle": "muscle",
+    "Others": "others",
+    "Pancreas": "pancreas",
+    "RV_blood_pool_myocardium": "heart_muscle",
+    "Skin": "skin",
+    "Spinal_cord": "spinal_cord",
+    "Spleen": "spleen",
+    "Stomach": "muscle",
+}
+
 new_labels = set()
 for value in GROUPING_RULES.values():
     new_labels.add(value)
