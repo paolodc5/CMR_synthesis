@@ -27,10 +27,11 @@ logger = get_logger(__name__, log_level="INFO")
 
 @dataclass
 class TrainingConfig:
-    run_name: str = "LDM"
+    run_name: str = "LDM_fg"
     data_path: str = "./DIDC_multiclass_coro_v2_prep"
-    exp_dir: str = './experiments/DIDCV2/diffusion' 
-    vae_pretrained_path: str = "./experiments/DIDC_VAE/20260225_1651_VAE_KL_train/checkpoint_epoch"
+    exp_dir: str = "./experiments/DIDCV2/diffusion"
+    vae_pretrained_path: str = "./experiments/DIDC_VAE/20260302_1211_VAE_KL_train_no_adv/checkpoint_epoch" 
+    vae_fg_pretrained_path: str = "./experiments/DIDC_VAE/20260304_0905_VAE_KL_train_fg/checkpoint_epoch" # Optional separate VAE for foreground masks, if None the same VAE will be used for both images and masks
 
     val_fraction: float = 0.2
     num_input_classes: int = 22
@@ -54,10 +55,10 @@ class TrainingConfig:
 
     # Logging & Saving
     save_image_epochs: int = 5
-    save_model_epochs: int = 5
+    save_model_epochs: int = 1
     num_workers: int = 8
     mixed_precision: str = "fp16" 
-    notes: str = "Latent Diffusion model conditional training with custom VAE"
+    notes: str = "Latent Diffusion model conditional training with custom VAE and custom VAE for foreground masks"
     seed: int = 187
     
     gradient_accumulation_steps: int = 1
@@ -70,7 +71,7 @@ class TrainingConfig:
         self.run_dir = os.path.join(self.exp_dir, f"{timestamp}_{self.run_name}")
 
 class LatentDiffusionTrainer:
-    def __init__(self, config: TrainingConfig, model, vae, noise_scheduler, optimizer, lr_scheduler, train_loader, val_loader, accelerator, new_labels):
+    def __init__(self, config: TrainingConfig, model, vae, noise_scheduler, optimizer, lr_scheduler, train_loader, val_loader, accelerator, new_labels, vae_fg=None):
         self.config = config
         self.model = model
         self.vae = vae
@@ -83,6 +84,7 @@ class LatentDiffusionTrainer:
         self.scale_factor = vae.config.scaling_factor
         self.new_labels = new_labels
         self.latent_channels = vae.config.latent_channels
+        self.vae_fg = vae_fg
 
         self.metrics_history = {
             'train_loss': [], 'val_loss': [], 'sample_dice_loss': [], 'lr': []
@@ -94,7 +96,10 @@ class LatentDiffusionTrainer:
         """Handles scaling and encoding of both clean images and foreground masks into the VAE latent space."""
         x = x * 2.0 - 1.0 # Pixel from [0,1] to [-1,1]
         
-        posterior = self.vae.encode(x).latent_dist # Same VAE for both images and fg masks
+        if self.vae_fg and is_fg:
+            posterior = self.vae_fg.encode(x).latent_dist
+        else:
+            posterior = self.vae.encode(x).latent_dist # Same VAE for both images and fg masks
         
         if use_mode or is_fg:
             z = posterior.mode()
@@ -119,9 +124,11 @@ class LatentDiffusionTrainer:
             dtype=fg_masks.dtype
         )
 
-        fg_indices = [self.new_labels.index(label) for label in ['Background', 'LV_blood_pool', 'LV_Myocardium', 'RV_blood_pool_myocardium']]
-        mapped_fg_masks[:, fg_indices, :, :] = fg_masks
-
+        if not self.vae_fg:
+            fg_indices = [self.new_labels.index(label) for label in ['Background', 'LV_blood_pool', 'LV_Myocardium', 'RV_blood_pool_myocardium']]
+            mapped_fg_masks[:, fg_indices, :, :] = fg_masks
+        else:
+            mapped_fg_masks = fg_masks
 
         # encoding
         z0 = self.encode_to_latent(clean_images, is_fg=False, use_mode=False)
@@ -137,8 +144,13 @@ class LatentDiffusionTrainer:
         noise = torch.randn_like(z0)
         z_t = self.noise_scheduler.add_noise(z0, noise, timesteps)
 
-        # Concatenazione nello spazio latente
-        net_input = torch.cat([z_t, enc_fg], dim=1) if self.config.conditional_generation else z_t
+        # Concat in the latent space
+        try:
+            net_input = torch.cat([z_t, enc_fg], dim=1) if self.config.conditional_generation else z_t
+        except Exception as e:
+            logger.error(f"Error during concatenation: z_t shape {z_t.shape}, enc_fg shape {enc_fg.shape}")
+            raise e
+
 
         with torch.set_grad_enabled(is_training):
             noise_pred = self.model(net_input, timesteps).sample
@@ -296,6 +308,18 @@ def main():
         param.requires_grad = False
     logger.info("VAE loaded and frozen.")
 
+    if config.vae_fg_pretrained_path:
+        logger.info("Loading separate pretrained VAE for foreground masks...")
+        vae_fg = AutoencoderKL.from_pretrained(config.vae_fg_pretrained_path).to(accelerator.device)
+        vae_fg.eval()
+        for param in vae_fg.parameters():
+            param.requires_grad = False
+        logger.info("Foreground VAE loaded and frozen.")
+    else:
+        vae_fg = None
+        logger.info("No separate VAE for foreground masks specified, using the same VAE for both images and masks.")
+
+
     dataset_config_path = os.path.join(config.data_path, "dataset_config.json")
     if os.path.exists(dataset_config_path):
         with open(dataset_config_path, "r") as f:
@@ -326,7 +350,9 @@ def main():
     noise_scheduler = DDPMScheduler(num_train_timesteps=config.num_train_timesteps, beta_schedule="sigmoid")
     
     # parameters that depend on the VAE config
-    in_channels = vae.config.latent_channels * 2 if config.conditional_generation else vae.config.latent_channels # Handle number of channels
+    in_channels = vae.config.latent_channels if config.conditional_generation else vae.config.latent_channels # Handle number of channels
+    if config.vae_fg_pretrained_path:
+        in_channels += vae_fg.config.latent_channels if config.conditional_generation else 0 # Add channels for foreground conditioning if using separate VAE
     out_channels = vae.config.latent_channels
 
     # UNet model for noise prediction
@@ -357,7 +383,8 @@ def main():
         train_loader=train_dataloader,
         val_loader=val_dataloader,
         accelerator=accelerator,
-        new_labels=dataset_config['new_labels_used']
+        new_labels=dataset_config['new_labels_used'],
+        vae_fg=vae_fg
     )
     
     logger.info("Start training LDM ... ")
