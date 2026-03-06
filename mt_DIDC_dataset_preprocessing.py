@@ -14,7 +14,7 @@ def create_mmap_dataset(source_dir, dest_dir, save_images=False):
     dataset_params = {
         "source_data": source_dir,
         "target_size_preprocessing": 384,
-        "rm_black_slices": True,
+        "rm_black_slices": False,
         "remap_nn": False,
         "threshold_classes": None,
         "min_blob_size": None,
@@ -48,7 +48,10 @@ def create_mmap_dataset(source_dir, dest_dir, save_images=False):
 
         pat = np.load(path, allow_pickle=True).item()
         sums = pat['mask_foreground'].sum(axis=(0,1))
-        valid_indices = np.where(sums > 0)[0]
+        if dataset_params["rm_black_slices"]:
+            valid_indices = np.where(sums > 0)[0]
+        else:
+            valid_indices = np.arange(sums.shape[0])
 
         if len(valid_indices) == 0:
             continue

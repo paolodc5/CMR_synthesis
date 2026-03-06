@@ -176,7 +176,7 @@ def sanitize_config(config_dict):
 
     return sanitized_config
 
-def setup_logger(log_dir):
+def setup_logger(log_dir, filename="training.log"):
     os.makedirs(log_dir, exist_ok=True)
     for handler in logging.root.handlers[:]:
         logging.root.removeHandler(handler)
@@ -184,7 +184,7 @@ def setup_logger(log_dir):
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
         handlers=[
-            logging.FileHandler(os.path.join(log_dir, "training.log")),
+            logging.FileHandler(os.path.join(log_dir, filename)),
             logging.StreamHandler(sys.stdout)
         ]
     )

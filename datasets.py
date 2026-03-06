@@ -574,12 +574,12 @@ class FastDatasetDIDC(Dataset):
 
         if file_list is None:
             all_files = os.listdir(data_path)
-            patient_ids = sorted(list(set([f.replace('_fg.npy', '').replace('_mask.npy', '') for f in all_files if f.endswith('.npy')])))
+            patient_ids = sorted(list(set([f.replace('_fg.npy', '') for f in all_files if f.endswith('fg.npy')])))
         else:
             patient_ids = [f.replace('.npy', '') for f in file_list]
 
         self.samples = []
-        for pat_id in patient_ids[:-1]:
+        for pat_id in patient_ids:
             fg_path = os.path.join(data_path, f"{pat_id}_fg.npy")
 
             if os.path.exists(fg_path):

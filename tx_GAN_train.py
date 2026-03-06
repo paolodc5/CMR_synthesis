@@ -62,12 +62,16 @@ class CustomDatasetTexturizer(FastDatasetDIDC):
         self.config = config
 
     def __getitem__(self, idx):
-        # Carica le label originali e le proprietà
-        sample = super().__getitem__(idx)
-        labels = sample['multiClassMask']
-        
+        # load the original sample and take only the mask
+        original_sample = super().__getitem__(idx)
+        label = original_sample['multiClassMask']
 
-        return labels
+        # load mri slice from the same pat/slice
+        pat_id, slice_idx = self.samples[idx]
+        pat_path = os.path.join(self.data_path, f"{pat_id}_fg.npy")
+        mri_slice = np.load(pat_path, mmap_mode='r')[slice_idx]
+
+        return {'input_label': label, 'mri_slice': mri_slice}
 
 
 if __name__ == "__main__":
@@ -79,6 +83,6 @@ if __name__ == "__main__":
 
     dataset = CustomDatasetTexturizer(config)
     print(f"Dataset loaded with {len(dataset)} samples")
-    labels = dataset[44]
-    print(f"Sample labels shape: {labels.shape}, unique labels: {torch.unique(labels)}")
-
+    sample = dataset[44]
+    print(f"Sample labels shape: {sample['input_label'].shape}, unique labels: {torch.unique(sample['input_label'])}")
+    print(f"Sample mri slice shape: {sample['mri_slice'].shape}. Value range: [{torch.min(sample['mri_slice'])}, {torch.max(sample['mri_slice'])}]")

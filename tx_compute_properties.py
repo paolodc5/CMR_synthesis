@@ -13,15 +13,15 @@ from dataclasses import dataclass, asdict
 from tqdm import tqdm
 import json
 
-from mt_DIDC_config import GROUPING_RULES, PROPERTY_KEY, LABEL2LABEL
+from mt_DIDC_config import GROUPING_RULES, PROPERTY_KEY, LABEL2LABEL, NEW_LABELS
 
 from utils import load_original_labels, setup_logger, set_reproducibility
 
 
 @dataclass
 class Config:
-    data_dir: str = './DIDC_multiclass_coro_v2'
-    out_dir: str = './DIDC_multiclass_coro_v2_properties'
+    data_dir: str = './DIDC_multiclass_coro_v2_prep_2'
+    out_dir: str = './DIDC_multiclass_coro_v2_prep_2'
     
     epochs: int = 500
     lr: float = 0.001
@@ -34,6 +34,8 @@ class Config:
     upsample_factor: int = 1
 
     save_hd_images: bool = False
+    slices_first: bool = True
+    mapping_from_old_labels: bool = False # Whether to use the label2label mapping derived from the old grouping rules (if False, it will use the provided LABEL2LABEL mapping directly)
 
     seed: int = 187
 
@@ -63,7 +65,8 @@ class PropertyGenerator:
                  label2idx: list = None, 
                  label2label_old: dict = None,
                  pat_id: str = None,
-                 save_images: bool = False):
+                 save_images: bool = False,
+                 slices_first: bool = True):
         if device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:
@@ -83,9 +86,17 @@ class PropertyGenerator:
         
         self.properties_keys = properties_key
         self.label2idx = label2idx
-        self.label2label = {old_label: label2label[new_label] for old_label, new_label in label2label_old.items()} # mapping from old labels to the final labels (skipping the "new" 22 label step)
+        
+        if label2label_old:
+            self.label2label = {old_label: label2label[new_label] for old_label, new_label in label2label_old.items()} # mapping from old labels to the final labels (skipping the "new" 22 label step)
+        else:
+            self.label2label = label2label
+
+        assert set(self.label2label.keys()) == set(label2idx), "All keys in label2label must be present in label2idx"
+
         self.pat_id = pat_id
         self.save_images = save_images
+        self.slices_first = slices_first
 
     def _initialize_tissue_maps(self, mask):
         """Creates initial tissue starting from the mask"""
@@ -183,9 +194,13 @@ class PropertyGenerator:
         labels_hd = scipy.ndimage.zoom(labels_volume, (1, upsample_factor, upsample_factor), order=0)
         
         h, w, slices = mri_hd.shape
-        tissue_props = np.zeros((3, h, w, slices), dtype=np.float32)
+
+        if self.slices_first:
+            tissue_props = np.zeros((slices, 3, h, w), dtype=np.float32)
+        else:
+            tissue_props = np.zeros((3, h, w, slices), dtype=np.float32)
         
-        os.makedirs(os.path.join(out_path, f'images/{self.pat_id}/'), exist_ok=True)
+        os.makedirs(os.path.join(out_path, f'simulated_images/{self.pat_id}/'), exist_ok=True)
 
         avg_pat_loss = 0.0
         for s in range(slices):
@@ -193,7 +208,10 @@ class PropertyGenerator:
             props, pred_img, init_props, scale, loss, epoch = self.fit_slice(mri_hd[..., s], labels_hd[..., s], slice_idx=s, total_slices=slices)
             avg_pat_loss += loss
 
-            tissue_props[..., s] = props
+            if self.slices_first:
+                tissue_props[s] = props
+            else:
+                tissue_props[..., s] = props
             
             if s == 120 or s == 180:
                 fig, ax = plt.subplots(1, 2, figsize=(10, 5))
@@ -201,7 +219,7 @@ class PropertyGenerator:
                 ax[0].set_title("Real MRI")
                 ax[1].imshow(pred_img, cmap='gray')
                 ax[1].set_title("Simulated bSSFP")
-                plt.savefig(os.path.join(out_path, f'images/{self.pat_id}/MRI_{s:05d}.png'), dpi=150)
+                plt.savefig(os.path.join(out_path, f'simulated_images/{self.pat_id}/MRI_{s:05d}.png'), dpi=150)
                 plt.close()
         
         avg_pat_loss /= slices
@@ -210,40 +228,44 @@ class PropertyGenerator:
         if self.save_images:
             np.save(os.path.join(out_path, f'{self.pat_id}_MRI_matrix_HD.npy'), mri_hd)
             np.save(os.path.join(out_path, f'{self.pat_id}_labels_matrix_HD.npy'), labels_hd)
-        np.save(os.path.join(out_path, f'{self.pat_id}_tissue_props.npy'), tissue_props) # shape (3, H, W, S)
+        np.save(os.path.join(out_path, f'{self.pat_id}_props.npy'), tissue_props) # shape (3, H, W, S)
 
 def main():
     config = Config()
 
     set_reproducibility(config.seed)
     os.makedirs(config.out_dir, exist_ok=True)
-    setup_logger(config.out_dir)
-    
-    with open(os.path.join(config.out_dir, 'config.json'), 'w') as f:
+    setup_logger(config.out_dir, filename="properties_computation.log")
+
+    with open(os.path.join(config.out_dir, 'properties_config.json'), 'w') as f:
         json.dump(asdict(config), f, indent=4)
 
     logging.info(f"Selected device: {config.device}")
 
-    label2idx = load_original_labels(config.data_dir)
+    if config.mapping_from_old_labels:
+        label2idx = load_original_labels(config.data_dir)
+    else:
+        label2idx = NEW_LABELS
 
-    files = sorted([f for f in os.listdir(config.data_dir) if f.endswith('.npy')])
+    files = sorted([f for f in os.listdir(config.data_dir) if f.endswith('fg.npy')])
 
     pbar = tqdm(files, leave=True, desc="Processing Patients")
     for file in pbar:
-        pat_id = file.replace('.npy', '')
+        pat_id = file.replace('_fg.npy', '')
         pbar.set_description(f"Processing {pat_id}")
         
-        path = os.path.join(config.data_dir, file)
+        path_mask = os.path.join(config.data_dir, pat_id + '_mask.npy')
+        path_img = os.path.join(config.data_dir, pat_id + '_img.npy')
 
-        pat = np.load(path, allow_pickle=True).item()
-        mri_volume = pat['interpolated_intensity']
-        labels_volume = pat['interpolated_segmentation'] 
-
-        mask_volume = pat['mask_foreground']
-        bp_coords = np.where(mask_volume == 1) # Assuming the blood pool is labeled as 1 in the foreground volume
-        labels_volume[bp_coords] = label2idx.index('Artery_subclavian_right') # Relabeling blood pool as artery to be then mapped to the "blood" label
+        labels_volume = np.load(path_mask)
+        mri_volume = np.load(path_img)
 
         mri_volume = mri_volume / np.max(mri_volume) # Normalize to [0, 1] for better optimization stability
+        
+        if config.mapping_from_old_labels:
+            label2label_old = GROUPING_RULES
+        else:            
+            label2label_old = None
         
         generator = PropertyGenerator(epochs=config.epochs, 
                                       lr=config.lr, 
@@ -252,10 +274,11 @@ def main():
                                       properties_key=PROPERTY_KEY, 
                                       label2label=LABEL2LABEL, 
                                       label2idx=label2idx, 
-                                      label2label_old=GROUPING_RULES, 
+                                      label2label_old=label2label_old, 
                                       device=config.device,
                                       save_images=config.save_hd_images,
-                                      pat_id=pat_id)
+                                      pat_id=pat_id,
+                                      slices_first=config.slices_first)
         generator.process_volume(mri_volume, labels_volume, config.out_dir, upsample_factor=config.upsample_factor)
 
 
