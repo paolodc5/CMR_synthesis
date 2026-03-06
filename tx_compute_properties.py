@@ -193,7 +193,7 @@ class PropertyGenerator:
         mri_hd = scipy.ndimage.zoom(mri_volume, (1, upsample_factor, upsample_factor), order=1)
         labels_hd = scipy.ndimage.zoom(labels_volume, (1, upsample_factor, upsample_factor), order=0)
         
-        h, w, slices = mri_hd.shape
+        slices, h, w = mri_hd.shape
 
         if self.slices_first:
             tissue_props = np.zeros((slices, 3, h, w), dtype=np.float32)
@@ -205,7 +205,7 @@ class PropertyGenerator:
         avg_pat_loss = 0.0
         for s in range(slices):
             # Executes optimization
-            props, pred_img, init_props, scale, loss, epoch = self.fit_slice(mri_hd[..., s], labels_hd[..., s], slice_idx=s, total_slices=slices)
+            props, pred_img, init_props, scale, loss, epoch = self.fit_slice(mri_hd[s], labels_hd[s], slice_idx=s, total_slices=slices)
             avg_pat_loss += loss
 
             if self.slices_first:
@@ -215,7 +215,7 @@ class PropertyGenerator:
             
             if s == 120 or s == 180:
                 fig, ax = plt.subplots(1, 2, figsize=(10, 5))
-                ax[0].imshow(mri_hd[..., s], cmap='gray')
+                ax[0].imshow(mri_hd[s], cmap='gray')
                 ax[0].set_title("Real MRI")
                 ax[1].imshow(pred_img, cmap='gray')
                 ax[1].set_title("Simulated bSSFP")
@@ -235,9 +235,9 @@ def main():
 
     set_reproducibility(config.seed)
     os.makedirs(config.out_dir, exist_ok=True)
-    setup_logger(config.out_dir, filename="properties_computation.log")
+    setup_logger(config.out_dir, filename="computation_properties.log")
 
-    with open(os.path.join(config.out_dir, 'properties_config.json'), 'w') as f:
+    with open(os.path.join(config.out_dir, 'config_properties.json'), 'w') as f:
         json.dump(asdict(config), f, indent=4)
 
     logging.info(f"Selected device: {config.device}")
