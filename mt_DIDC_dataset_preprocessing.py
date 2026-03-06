@@ -5,8 +5,10 @@ from datasets import LazyDatasetDIDC
 from tqdm import tqdm
 import numpy as np
 import torch
+import torchvision.transforms.functional as TF
 
-def create_mmap_dataset(source_dir, dest_dir):
+
+def create_mmap_dataset(source_dir, dest_dir, save_images=False):
     os.makedirs(dest_dir, exist_ok=True)
     
     dataset_params = {
@@ -18,7 +20,8 @@ def create_mmap_dataset(source_dir, dest_dir):
         "min_blob_size": None,
         "num_fg_classes_preprocessing": 4,
         "grouping_rules_used": GROUPING_RULES,
-        "new_labels_used": NEW_LABELS
+        "new_labels_used": NEW_LABELS,
+        "save_images": save_images
     }
     
     config_path = os.path.join(dest_dir, "dataset_config.json")
@@ -52,9 +55,14 @@ def create_mmap_dataset(source_dir, dest_dir):
 
         fg_list = []    
         mask_list = []
+        img_list = []
         for idx in valid_indices:
             fg_slice = torch.from_numpy(pat['mask_foreground'][:,:,idx]).unsqueeze(0).long()
             fg_slice[(fg_slice > 3) | (fg_slice < 0)] = 0 # remove noisy labels in the foreground mask
+
+            if save_images:
+                img_slice = torch.from_numpy(pat['interpolated_intensity'][:,:,idx])
+                img_slice = TF.resize(img_slice.unsqueeze(0), dataset_params["target_size_preprocessing"], interpolation=TF.InterpolationMode.BILINEAR).squeeze(0)
 
             mask_vol = pat['interpolated_segmentation']
             if mask_vol.ndim == 1:
@@ -70,21 +78,28 @@ def create_mmap_dataset(source_dir, dest_dir):
                 mask_proc = mask_proc.squeeze(0)
 
             fg_list.append(fg_proc)
-            mask_list.append(mask_proc)        
-
-
+            mask_list.append(mask_proc)
+            if save_images:
+                img_list.append(img_slice)
 
         fg_stack = torch.stack(fg_list, dim=0)
         mask_stack = torch.stack(mask_list, dim=0)
 
         np.save(os.path.join(dest_dir, f"{pat_id}_fg.npy"), fg_stack.numpy())
         np.save(os.path.join(dest_dir, f"{pat_id}_mask.npy"), mask_stack.numpy())
+        if save_images:
+            img_stack = torch.stack(img_list, dim=0)
+            np.save(os.path.join(dest_dir, f"{pat_id}_img.npy"), img_stack.numpy())
                 
-         
+        # msg = f"Processed {file}: fg shape {fg_stack.shape}, mask shape {mask_stack.shape}"
+        # if save_images:
+        #     msg += f", img shape {img_stack.shape}"
+        # print(msg)
 
 
 if __name__ == "__main__":
     source_dir = 'DIDC_multiclass_coro_v2'
     dest_dir = 'DIDC_multiclass_coro_v2_prep_2'
-    create_mmap_dataset(source_dir, dest_dir)
+    save_images = True
+    create_mmap_dataset(source_dir, dest_dir, save_images)
     

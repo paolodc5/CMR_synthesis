@@ -15,7 +15,7 @@ import json
 
 from mt_DIDC_config import GROUPING_RULES, PROPERTY_KEY, LABEL2LABEL
 
-from utils import load_original_labels, setup_logger
+from utils import load_original_labels, setup_logger, set_reproducibility
 
 
 @dataclass
@@ -34,6 +34,8 @@ class Config:
     upsample_factor: int = 1
 
     save_hd_images: bool = False
+
+    seed: int = 187
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -183,8 +185,7 @@ class PropertyGenerator:
         h, w, slices = mri_hd.shape
         tissue_props = np.zeros((3, h, w, slices), dtype=np.float32)
         
-        if not os.path.exists(os.path.join(out_path, 'images')):
-            os.makedirs(os.path.join(out_path, f'images/{self.pat_id}/'), exist_ok=True)
+        os.makedirs(os.path.join(out_path, f'images/{self.pat_id}/'), exist_ok=True)
 
         avg_pat_loss = 0.0
         for s in range(slices):
@@ -200,7 +201,7 @@ class PropertyGenerator:
                 ax[0].set_title("Real MRI")
                 ax[1].imshow(pred_img, cmap='gray')
                 ax[1].set_title("Simulated bSSFP")
-                plt.savefig(os.path.join(out_path, f'images/{self.pat_id}/_MRI_{s:05d}.png'), dpi=150)
+                plt.savefig(os.path.join(out_path, f'images/{self.pat_id}/MRI_{s:05d}.png'), dpi=150)
                 plt.close()
         
         avg_pat_loss /= slices
@@ -214,9 +215,10 @@ class PropertyGenerator:
 def main():
     config = Config()
 
+    set_reproducibility(config.seed)
     os.makedirs(config.out_dir, exist_ok=True)
     setup_logger(config.out_dir)
-
+    
     with open(os.path.join(config.out_dir, 'config.json'), 'w') as f:
         json.dump(asdict(config), f, indent=4)
 
