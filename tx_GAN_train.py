@@ -74,7 +74,7 @@ class GANTrainerConfig:
     autoenc_path = str = ""
     
     # Hyperparams
-    train_batch_size: int = 32
+    train_batch_size: int = 36
     batch_size_per_gpu: int = 12
     num_workers: int = 8
 
@@ -336,7 +336,6 @@ class GANTrainer:
             "loss_G_adv": loss_G_adv.item(),
             "loss_G_prop": loss_G_prop.item(),
             "loss_G_phys": loss_G_phys.item(),
-            "current_step": self.global_step,
             "current_epoch": self.global_step // len(self.train_loader)
         }
 
@@ -344,7 +343,7 @@ class GANTrainer:
         """Loop principale di training."""
         logger.info("Starting training...")
         
-        target_batch_idx = len(self.val_loader) // 2 # choose a "middle batch" for validation
+        target_batch_idx = len(self.val_loader) // 2+70 # choose a "middle batch" for validation
         self.fixed_val_batch = 0
         for i, batch in enumerate(self.val_loader):
             if i == target_batch_idx:
@@ -363,9 +362,7 @@ class GANTrainer:
                 
                 self.global_step += 1
 
-                if step > 30:
-                    break
-            
+            logger.info(f"Epoch {epoch}: " + ", ".join([f"{k}={v:.4f}" for k, v in metrics.items()]))
             if self.accelerator.is_main_process and (epoch % self.config.log_image_epochs == 0 or epoch == self.config.num_epochs - 1):
                 self._log_images(self.fixed_val_batch, epoch)
             
