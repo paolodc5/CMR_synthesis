@@ -5,6 +5,7 @@ import logging
 
 import numpy as np
 import math
+import matplotlib.pyplot as plt
 
 from datetime import datetime
 from dataclasses import asdict, dataclass, field
@@ -23,7 +24,7 @@ from datasets import FastDatasetDIDC
 from gan_basic import DiscriminatorModel
 from unet_advanced import UNetAdvanced as GeneratorModel
 from mt_DIDC_config import GROUPING_RULES, LABEL2LABEL, PROPERTY_KEY, NEW_LABELS
-from utils import setup_logger
+from utils import setup_logger, set_reproducibility
 
 from accelerate import Accelerator
 from accelerate.logging import get_logger
@@ -66,7 +67,7 @@ class GeneratorConfig:
 
 @dataclass
 class GANTrainerConfig:
-    run_name: str = "test"
+    run_name: str = "texturizer_GAN_train"
     exp_dir: str = "./experiments/DIDCV2_TEXT"
     
     data_path: str = "./DIDC_multiclass_coro_v2_prep_2"
@@ -74,7 +75,9 @@ class GANTrainerConfig:
     
     # Hyperparams
     train_batch_size: int = 32
-    batch_size_per_gpu: int = 16
+    batch_size_per_gpu: int = 12
+    num_workers: int = 8
+
     val_fraction: float = 0.2
     num_epochs: int = 100
     lr_gen: float = 1e-4
@@ -274,21 +277,21 @@ class GANTrainer:
 
         gt_offsets = self.bssfp_sim.get_offsets_from_absolute(absolute_gt_props, condition) # retrieves the target offsets
     
-        pred_offsets = self.gen(condition)
-
         # train discriminator
         self.discr.train()
         with self.accelerator.accumulate(self.discr):
             self.opt_D.zero_grad()
 
+            self.gen.eval()
+            with torch.no_grad():
+                pred_offsets_detached = self.gen(condition)
+
             real_pair = torch.cat([condition, gt_offsets], dim=1)
-            fake_pair = torch.cat([condition, pred_offsets.detach()], dim=1)
+            fake_pair = torch.cat([condition, pred_offsets_detached], dim=1)
             
-            combined_pair = torch.cat([real_pair, fake_pair], dim=0)
+            combined_pair = torch.cat([real_pair, fake_pair], dim=0) # this is necessary for distributed training
             d_combined = self.discr(combined_pair)
             d_real, d_fake = torch.split(d_combined, real_pair.shape[0])
-            # d_real = self.discr(real_pair)
-            # d_fake = self.discr(fake_pair)
             
             loss_D_real = self.criterion_GAN(d_real, torch.ones_like(d_real))
             loss_D_fake = self.criterion_GAN(d_fake, torch.zeros_like(d_fake))
@@ -301,13 +304,20 @@ class GANTrainer:
         self.gen.train()
         with self.accelerator.accumulate(self.gen):
             self.opt_G.zero_grad()
-            
+
+            pred_offsets = self.gen(condition)
             fake_pair_for_G = torch.cat([condition, pred_offsets], dim=1)
 
             self.discr.eval()
+            for param in self.discr.parameters():
+                param.requires_grad = False
+
             d_fake_for_G = self.discr(fake_pair_for_G)
             loss_G_adv = self.criterion_GAN(d_fake_for_G, torch.ones_like(d_fake_for_G))
             
+            for param in self.discr.parameters():
+                param.requires_grad = True
+
             # Properties Loss (L1 over T1, T2, PD)
             loss_G_prop = self.criterion_L1(pred_offsets, gt_offsets)
             
@@ -334,26 +344,35 @@ class GANTrainer:
         """Loop principale di training."""
         logger.info("Starting training...")
         
+        target_batch_idx = len(self.val_loader) // 2 # choose a "middle batch" for validation
+        self.fixed_val_batch = 0
+        for i, batch in enumerate(self.val_loader):
+            if i == target_batch_idx:
+                self.fixed_val_batch = batch
+                break
+
 
         for epoch in range(self.config.num_epochs):
             progress_bar = tqdm(self.train_loader, disable=not self.accelerator.is_local_main_process, desc=f"Epoch {epoch}")
             
-            for batch in progress_bar:
+            for step, batch in enumerate(progress_bar):
                 metrics = self.train_step(batch)
                 
                 self.accelerator.log(metrics, step=self.global_step)
                 progress_bar.set_postfix(**{k: f"{v:.4f}" for k, v in metrics.items()})
                 
                 self.global_step += 1
+
+                if step > 30:
+                    break
             
             if self.accelerator.is_main_process and (epoch % self.config.log_image_epochs == 0 or epoch == self.config.num_epochs - 1):
-                val_batch = next(iter(self.val_loader))
-                self._log_images(val_batch, epoch)
+                self._log_images(self.fixed_val_batch, epoch)
             
             self.save_checkpoint(epoch)
 
     @torch.no_grad()
-    def _log_images(self, batch, epoch, n_images=4):
+    def _log_images(self, batch, epoch, n_images=8):
         """Genera e invia immagini di recap a TensorBoard."""
         if n_images > batch['input_label'].shape[0]:
             n_images = batch['input_label'].shape[0]
@@ -365,10 +384,13 @@ class GANTrainer:
         if self.config.gen_model.in_ch > 1:
             condition_gen = F.one_hot(condition.squeeze(1).long(), num_classes=self.config.gen_model.in_ch).permute(0, 3, 1, 2).float().contiguous() # (B, 1, H, W) -> (B, C, H, W)
 
-        pred_offsets = self.gen(condition_gen)
-        pred_img = self.bssfp_sim(pred_offsets, condition) # (B, H, W)
+        unwrapped_gen = self.accelerator.unwrap_model(self.gen)
+        unwrapped_sim = self.accelerator.unwrap_model(self.bssfp_sim)
+
+        pred_offsets = unwrapped_gen(condition_gen)
+        pred_img = unwrapped_sim(pred_offsets, condition) # (B, H, W)
         
-        cond_vis = condition.unsqueeze(1) / condition.max() 
+        cond_vis = condition.unsqueeze(1) / float(self.config.gen_model.in_ch - 1)
         gt_mri_vis = gt_mri.unsqueeze(1) / (gt_mri.max() + 1e-8)
         pred_img_vis = pred_img / (pred_img.max() + 1e-8)
         
@@ -378,8 +400,9 @@ class GANTrainer:
             if tracker.name == "tensorboard":
                 tracker.writer.add_image("Val/Condition_RealMRI_FakeMRI", grid, epoch)
         
-        saving_path = os.path.join(self.config.run_dir, f"/images/val_images_epoch_{epoch}.png")
-        os.makedirs(saving_path, exist_ok=True)
+        saving_dir = os.path.join(self.config.run_dir, f"images")
+        os.makedirs(saving_dir, exist_ok=True)
+        saving_path = os.path.join(saving_dir, f"val_images_epoch_{epoch}.png")
         vutils.save_image(grid, saving_path)
 
     def save_checkpoint(self, epoch):
@@ -396,6 +419,7 @@ class GANTrainer:
 
 def main():
     config = GANTrainerConfig()
+    set_reproducibility(config.seed)
     
     accelerator = Accelerator(
         mixed_precision=config.mixed_precision,
@@ -432,8 +456,8 @@ def main():
 
     train_dataset = CustomDatasetTexturizer(data_path=config.data_path, file_list=train_files)
     val_dataset = CustomDatasetTexturizer(data_path=config.data_path, file_list=val_files)
-    train_loader = DataLoader(train_dataset, batch_size=config.batch_size_per_gpu, shuffle=True, num_workers=8)
-    val_dataloader = DataLoader(val_dataset, batch_size=config.batch_size_per_gpu, shuffle=False, num_workers=8)
+    train_loader = DataLoader(train_dataset, batch_size=config.batch_size_per_gpu, shuffle=True, num_workers=config.num_workers)
+    val_dataloader = DataLoader(val_dataset, batch_size=config.batch_size_per_gpu, shuffle=False, num_workers=config.num_workers)
 
     gen = GeneratorModel(**asdict(config.gen_model)) # input channels: 1 or 22
     discr = DiscriminatorModel(**asdict(config.discr_model)) # 4 channels: (1 condition + 3 offset)
