@@ -8,21 +8,26 @@ import math
 
 from datetime import datetime
 from dataclasses import asdict, dataclass, field
+from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.utils as vutils
+from torch.utils.data import DataLoader
+
+from sklearn.model_selection import train_test_split
 
 from datasets import FastDatasetDIDC
-
 from gan_basic import DiscriminatorModel
+from unet_advanced import UNetAdvanced as GeneratorModel
+from mt_DIDC_config import GROUPING_RULES, LABEL2LABEL, PROPERTY_KEY, NEW_LABELS
+from utils import setup_logger
 
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 
-from mt_DIDC_config import LABEL2LABEL, PROPERTY_KEY, NEW_LABELS
 
 # Setup logger
 logger = get_logger(__name__, log_level="INFO")
@@ -41,33 +46,59 @@ class BSSFPConfig:
     label2label: dict = field(default_factory=lambda: LABEL2LABEL.copy())
     label2idx: list = field(default_factory=lambda: NEW_LABELS.copy())
 
+
+@dataclass
+class DiscrConfig:
+    in_ch: int = 25 # 22 ch output + 3 ch condition
+    base_ch: int = 64
+    use_fc: bool = False
+
+
+@dataclass
+class GeneratorConfig:
+    in_ch: int = 22 
+    num_classes: int = 3
+    base_ch: int = 64
+    block: str = "BasicBlock"
+    pool: bool = False
+    dropout_p: float = 0.3
+
+
 @dataclass
 class GANTrainerConfig:
-    run_name: str = ""
+    run_name: str = "test"
     exp_dir: str = "./experiments/DIDCV2_TEXT"
     
-    data_path: str = './DIDC_multiclass_coro_v2_prep_2'
+    data_path: str = "./DIDC_multiclass_coro_v2_prep_2"
+    autoenc_path = str = ""
     
     # Hyperparams
-    train_batch_size: int = 8
+    train_batch_size: int = 32
+    batch_size_per_gpu: int = 16
     val_fraction: float = 0.2
     num_epochs: int = 100
     lr_gen: float = 1e-4
     lr_discr: float = 1e-4
     lambda_perceptual: float = 10.0
     lambda_physics: float = 5.0 # Peso per la loss valutata sull'immagine generata
-    
+
     mixed_precision: str = "fp16"
-    gradient_accumulation_steps: int = 1
+
+    log_image_epochs = 1
 
     seed: int = 187
     run_dir: str = ""
+    gradient_accumulation_steps: int = 1
 
     bssfp_model: BSSFPConfig = field(default_factory=BSSFPConfig)
+    discr_model: DiscrConfig = field(default_factory=DiscrConfig)
+    gen_model: GeneratorConfig = field(default_factory=GeneratorConfig)
 
     def __post_init__(self):
         timestamp = datetime.now().strftime('%Y%m%d_%H%M')
         self.run_dir = os.path.join(self.exp_dir, f"{timestamp}_{self.run_name}")
+        num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+        self.gradient_accumulation_steps = max(1, self.train_batch_size // (self.batch_size_per_gpu * num_gpus))
 
 
 class CustomDatasetTexturizer(FastDatasetDIDC):
@@ -126,6 +157,8 @@ class bSSFPSimulator(nn.Module):
         masks: Tensor (B, 1, H, W) or (B, H, W) with the multi-tissue labels.
         Returns: Tensor (B, 3, H, W) with the normalized pure offsets.
         """
+        if masks.ndim == 4:
+            masks = torch.argmax(masks, dim=1)
         init_props = self._initialize_tissue_maps(masks)
         
         max_vals = torch.tensor(
@@ -164,8 +197,11 @@ class bSSFPSimulator(nn.Module):
             
         mask = mask.long() # must be long type for indexing
         init_prop = self.tissue_lut[mask]   # (B, H, W) -> (B, H, W, 3)
+        if mask.ndim == 4:
+            init_prop = init_prop.argmax(1)
+
         init_prop = init_prop.permute(0, 3, 1, 2) # (B, H, W, 3) -> (B, 3, H, W)
-        
+
         return init_prop
 
     def _bssfp_signal_model(self, offsets: torch.Tensor, init_values: torch.Tensor) -> torch.Tensor:
@@ -223,27 +259,36 @@ class GANTrainer:
         # Tracking states
         self.global_step = 0
 
-    def train_step(self, batch):
-        """Esegue un singolo step di training per D e G."""
-        condition = batch['input_label'].unsqueeze(1).float() # (B, 1, H, W)
-        absolute_gt_props = batch['props_slice']              # (B, 3, H, W)
-        gt_mri = batch['mri_slice']                           # (B, H, W)
+        logger.info("GANTrainer initialized correctly")
 
-        gt_offsets = self.bssfp_sim.get_offsets_from_absolute(absolute_gt_props, condition)
-        
+    def train_step(self, batch):
+        """Executes a single training step for D and G"""
+        original_mask = batch['input_label'].unsqueeze(1).float() # (B, 1, H, W) - add channel dimension for condition
+
+        condition = original_mask.clone()
+        if self.config.gen_model.in_ch > 1:
+            condition = F.one_hot(original_mask.squeeze(1).long(), num_classes=self.config.gen_model.in_ch).permute(0, 3, 1, 2).float().contiguous() # (B, 1, H, W) -> (B, C, H, W)
+
+        absolute_gt_props = batch['props_slice'].float()                           # (B, 3, H, W)
+        gt_mri = batch['mri_slice'].unsqueeze(1).float()                           # (B, 1, H, W)
+
+        gt_offsets = self.bssfp_sim.get_offsets_from_absolute(absolute_gt_props, condition) # retrieves the target offsets
+    
         pred_offsets = self.gen(condition)
-        
+
         # train discriminator
         self.discr.train()
         with self.accelerator.accumulate(self.discr):
             self.opt_D.zero_grad()
-            
-            # Il Discriminatore valuta la coppia (Condizione, Offsets)
+
             real_pair = torch.cat([condition, gt_offsets], dim=1)
             fake_pair = torch.cat([condition, pred_offsets.detach()], dim=1)
             
-            d_real = self.discr(real_pair)
-            d_fake = self.discr(fake_pair)
+            combined_pair = torch.cat([real_pair, fake_pair], dim=0)
+            d_combined = self.discr(combined_pair)
+            d_real, d_fake = torch.split(d_combined, real_pair.shape[0])
+            # d_real = self.discr(real_pair)
+            # d_fake = self.discr(fake_pair)
             
             loss_D_real = self.criterion_GAN(d_real, torch.ones_like(d_real))
             loss_D_fake = self.criterion_GAN(d_fake, torch.zeros_like(d_fake))
@@ -258,6 +303,8 @@ class GANTrainer:
             self.opt_G.zero_grad()
             
             fake_pair_for_G = torch.cat([condition, pred_offsets], dim=1)
+
+            self.discr.eval()
             d_fake_for_G = self.discr(fake_pair_for_G)
             loss_G_adv = self.criterion_GAN(d_fake_for_G, torch.ones_like(d_fake_for_G))
             
@@ -278,13 +325,16 @@ class GANTrainer:
             "loss_G": loss_G.item(),
             "loss_G_adv": loss_G_adv.item(),
             "loss_G_prop": loss_G_prop.item(),
-            "loss_G_phys": loss_G_phys.item()
+            "loss_G_phys": loss_G_phys.item(),
+            "current_step": self.global_step,
+            "current_epoch": self.global_step // len(self.train_loader)
         }
 
     def train(self):
         """Loop principale di training."""
-        logger.info("Iniziando il training...")
+        logger.info("Starting training...")
         
+
         for epoch in range(self.config.num_epochs):
             progress_bar = tqdm(self.train_loader, disable=not self.accelerator.is_local_main_process, desc=f"Epoch {epoch}")
             
@@ -296,22 +346,30 @@ class GANTrainer:
                 
                 self.global_step += 1
             
-            if self.accelerator.is_main_process and (epoch % 5 == 0 or epoch == self.config.num_epochs - 1):
-                self._log_images(batch, epoch)
-                self.save_checkpoint(epoch)
+            if self.accelerator.is_main_process and (epoch % self.config.log_image_epochs == 0 or epoch == self.config.num_epochs - 1):
+                val_batch = next(iter(self.val_loader))
+                self._log_images(val_batch, epoch)
+            
+            self.save_checkpoint(epoch)
 
     @torch.no_grad()
-    def _log_images(self, batch, epoch):
+    def _log_images(self, batch, epoch, n_images=4):
         """Genera e invia immagini di recap a TensorBoard."""
+        if n_images > batch['input_label'].shape[0]:
+            n_images = batch['input_label'].shape[0]
+
         self.gen.eval()
-        condition = batch['input_label'].unsqueeze(1).float()[:4]
-        gt_mri = batch['mri_slice'][:4].unsqueeze(1)
+        condition = batch['input_label'].float()[:n_images]
+        gt_mri = batch['mri_slice'][:n_images]
         
-        pred_offsets = self.gen(condition)
-        pred_img = self.bssfp_sim(pred_offsets, condition).unsqueeze(1) # (B, 1, H, W)
+        if self.config.gen_model.in_ch > 1:
+            condition_gen = F.one_hot(condition.squeeze(1).long(), num_classes=self.config.gen_model.in_ch).permute(0, 3, 1, 2).float().contiguous() # (B, 1, H, W) -> (B, C, H, W)
+
+        pred_offsets = self.gen(condition_gen)
+        pred_img = self.bssfp_sim(pred_offsets, condition) # (B, H, W)
         
-        cond_vis = condition / condition.max() 
-        gt_mri_vis = gt_mri / (gt_mri.max() + 1e-8)
+        cond_vis = condition.unsqueeze(1) / condition.max() 
+        gt_mri_vis = gt_mri.unsqueeze(1) / (gt_mri.max() + 1e-8)
         pred_img_vis = pred_img / (pred_img.max() + 1e-8)
         
         grid = vutils.make_grid(torch.cat([cond_vis, gt_mri_vis, pred_img_vis], dim=0), nrow=4, normalize=False)
@@ -319,10 +377,14 @@ class GANTrainer:
         for tracker in self.accelerator.trackers:
             if tracker.name == "tensorboard":
                 tracker.writer.add_image("Val/Condition_RealMRI_FakeMRI", grid, epoch)
+        
+        saving_path = os.path.join(self.config.run_dir, f"/images/val_images_epoch_{epoch}.png")
+        os.makedirs(saving_path, exist_ok=True)
+        vutils.save_image(grid, saving_path)
 
     def save_checkpoint(self, epoch):
-        """Salva i pesi dei modelli."""
-        save_dir = os.path.join(self.config.run_dir, f"checkpoint_epoch_{epoch}")
+        """Saves model weights"""
+        save_dir = os.path.join(self.config.run_dir, f"checkpoint")
         os.makedirs(save_dir, exist_ok=True)
         
         unwrapped_gen = self.accelerator.unwrap_model(self.gen)
@@ -341,31 +403,50 @@ def main():
         log_with="tensorboard",
         project_dir=config.run_dir
     )
-    
+
     if accelerator.is_main_process:
         os.makedirs(config.run_dir, exist_ok=True)
+        setup_logger(config.run_dir)
         accelerator.init_trackers("tb_tracker")
+    
+    dataset_config_path = os.path.join(config.data_path, "dataset_config.json")
+    config_properties_path = os.path.join(config.data_path, "config_properties.json")
+    if os.path.exists(dataset_config_path) and os.path.exists(config_properties_path):
+        with open(dataset_config_path, "r") as f:
+            dataset_config = json.load(f)
+        with open(config_properties_path) as f:
+            properties_config = json.load(f)
+    else:
+        raise FileNotFoundError(f"Dataset config not found: {dataset_config_path} or {config_properties_path}")
 
-    # ... (Caricamento Dataset, Dataloader) ...
-    # train_loader = DataLoader(dataset, batch_size=config.train_batch_size, shuffle=True)
+    all_files = sorted(list(set([f.replace('_props.npy', '') for f in os.listdir(config.data_path) if f.endswith('props.npy')])))
+    train_files, val_files = train_test_split(all_files, test_size=config.val_fraction, random_state=config.seed)
     
-    # 3. Inizializza i Modelli
-    # Qui entra in gioco la modularità. Purché il gen accetti (B, 1, H, W) e dia (B, 3, H, W),
-    # puoi passargli una UNet, uno SPADE o un Multiscale senza toccare il Trainer!
-    gen = nn.Conv2d(1, 3, 3, padding=1) # Placeholder per il tuo Generatore
-    discr = nn.Conv2d(4, 1, 3, padding=1) # Placeholder per il Discriminatore (1 cond + 3 offset)
-    
-    bssfp_sim = bSSFPSimulator(BSSFPConfig())
+    if accelerator.is_main_process:
+        with open(f"{config.run_dir}/train_val_split.json", "w") as f:
+            json.dump({'train_indices': train_files, 'val_indices': val_files}, f, indent=4)
+        with open(f"{config.run_dir}/grouping_rules_and_labels.json", "w") as f:
+            json.dump({'grouping_rules': GROUPING_RULES, 'new_labels': NEW_LABELS}, f, indent=4)
+        with open(f"{config.run_dir}/training_config.json", "w") as f:
+            json.dump({**asdict(config), **dataset_config, **properties_config}, f, indent=4)
+
+    train_dataset = CustomDatasetTexturizer(data_path=config.data_path, file_list=train_files)
+    val_dataset = CustomDatasetTexturizer(data_path=config.data_path, file_list=val_files)
+    train_loader = DataLoader(train_dataset, batch_size=config.batch_size_per_gpu, shuffle=True, num_workers=8)
+    val_dataloader = DataLoader(val_dataset, batch_size=config.batch_size_per_gpu, shuffle=False, num_workers=8)
+
+    gen = GeneratorModel(**asdict(config.gen_model)) # input channels: 1 or 22
+    discr = DiscriminatorModel(**asdict(config.discr_model)) # 4 channels: (1 condition + 3 offset)
+
+    bssfp_sim = bSSFPSimulator(config.bssfp_model)
     
     opt_G = torch.optim.Adam(gen.parameters(), lr=config.lr_gen)
     opt_D = torch.optim.Adam(discr.parameters(), lr=config.lr_discr)
     
-    # 4. Prepara tutto con Accelerate (Device placement, DDP, mixed precision automatico)
-    gen, discr, opt_G, opt_D, train_loader, bssfp_sim = accelerator.prepare(
-        gen, discr, opt_G, opt_D, train_loader, bssfp_sim
+    gen, discr, opt_G, opt_D, train_loader, val_dataloader, bssfp_sim = accelerator.prepare(
+        gen, discr, opt_G, opt_D, train_loader, val_dataloader, bssfp_sim
     )
     
-    # 5. Lancia il Trainer
     trainer = GANTrainer(
         config=config,
         gen=gen,
@@ -374,57 +455,68 @@ def main():
         opt_G=opt_G,
         opt_D=opt_D,
         train_loader=train_loader,
-        val_loader=None, # Aggiungilo quando crei lo split
+        val_loader=val_dataloader,
         accelerator=accelerator
     )
     
     trainer.train()
 
 
-
 if __name__ == "__main__":
-    config = GANTrainerConfig()
-
-    accelerator = Accelerator(mixed_precision=config.mixed_precision)
-
-    print(f"Starting GAN training with config: {asdict(config)}")
-
-    dataset = CustomDatasetTexturizer(data_path=config.data_path)
-    print(f"Dataset loaded with {len(dataset)} samples")
-    sample = dataset[120]
-    print(f"Sample labels shape: {sample['input_label'].shape}, unique labels: {torch.unique(sample['input_label'])}")
-    print(f"Sample mri slice shape: {sample['mri_slice'].shape}. Value range: [{torch.min(sample['mri_slice'])}, {torch.max(sample['mri_slice'])}]")
-    print(f"Sample props slice shape: {sample['props_slice'].shape}. Value range: [{torch.min(sample['props_slice'])}, {torch.max(sample['props_slice'])}]")
-
-    # simulate a forward pass through the bSSFP simulator to check if it runs without errors
-    bssfp_simulator = bSSFPSimulator(BSSFPConfig())
-    # bssfp_simulator = accelerator.prepare(bssfp_simulator)
-    sample_input = sample['input_label'].unsqueeze(0).unsqueeze(0).float() # (1, 1, H, W)
-    sample_props = sample['props_slice'].unsqueeze(0).float() # (1, 3, H, W)
-
-    # get offsets from absolute properties
-    offsets = bssfp_simulator.get_offsets_from_absolute(sample_props, sample_input)
-    print(f"Offsets shape: {offsets.shape}, value range: [{torch.min(offsets)}, {torch.max(offsets)}]")
-
-    # simulate the bSSFP signal
-    simulated_slice = bssfp_simulator(offsets, sample_input)
-    print(f"Simulated slice shape: {simulated_slice.shape}, value range: [{torch.min(simulated_slice)}, {torch.max(simulated_slice)}]")
-
-    # save the simulated slice as an image for visual inspection compared to the real MRI slice
-    import matplotlib.pyplot as plt
-    plt.figure(figsize=(10, 5))
-    plt.subplot(1, 2, 1)
-    plt.imshow(sample['mri_slice'], cmap='gray')
-    plt.title("Real MRI Slice")
-    plt.subplot(1, 2, 2)
-    plt.imshow(simulated_slice.squeeze(0).squeeze(0).detach().cpu().numpy(), cmap='gray')
-    plt.title("Simulated bSSFP Slice")
+    try:
+        main()
+    except Exception as e:
+        # logger.exception cattura automaticamente il Traceback e lo scrive nel log file!
+        logger.exception("Il training è crashato con il seguente errore:")
+        sys.exit(1)
     
-    os.makedirs("test", exist_ok=True)
-    plt.savefig(os.path.join("test", "bssfp_simulation_check.png"))
-    print(f"Saved bSSFP simulation check image")
+    # config = GANTrainerConfig()
 
-    # simulate single training step
+    # accelerator = Accelerator(mixed_precision=config.mixed_precision)
+
+    # print(f"Starting GAN training with config: {asdict(config)}")
+
+    # dataset = CustomDatasetTexturizer(data_path=config.data_path)
+    # print(f"Dataset loaded with {len(dataset)} samples")
+    # sample = dataset[120]
+    # print(f"Sample labels shape: {sample['input_label'].shape}, unique labels: {torch.unique(sample['input_label'])}")
+    # print(f"Sample mri slice shape: {sample['mri_slice'].shape}. Value range: [{torch.min(sample['mri_slice'])}, {torch.max(sample['mri_slice'])}]")
+    # print(f"Sample props slice shape: {sample['props_slice'].shape}. Value range: [{torch.min(sample['props_slice'])}, {torch.max(sample['props_slice'])}]")
+
+    # # simulate a forward pass through the bSSFP simulator to check if it runs without errors
+    # bssfp_simulator = bSSFPSimulator(BSSFPConfig())
+    # # bssfp_simulator = accelerator.prepare(bssfp_simulator)
+    # sample_input = sample['input_label'].unsqueeze(0).unsqueeze(0).float() # (1, 1, H, W)
+    # sample_props = sample['props_slice'].unsqueeze(0).float() # (1, 3, H, W)
+
+    # # get offsets from absolute properties
+    # offsets = bssfp_simulator.get_offsets_from_absolute(sample_props, sample_input)
+    # print(f"Offsets shape: {offsets.shape}, value range: [{torch.min(offsets)}, {torch.max(offsets)}]")
+
+    # # simulate the bSSFP signal
+    # simulated_slice = bssfp_simulator(offsets, sample_input)
+    # print(f"Simulated slice shape: {simulated_slice.shape}, value range: [{torch.min(simulated_slice)}, {torch.max(simulated_slice)}]")
+
+    # # save the simulated slice as an image for visual inspection compared to the real MRI slice
+    # import matplotlib.pyplot as plt
+    # plt.figure(figsize=(10, 5))
+    # plt.subplot(1, 2, 1)
+    # plt.imshow(sample['mri_slice'], cmap='gray')
+    # plt.title("Real MRI Slice")
+    # plt.subplot(1, 2, 2)
+    # plt.imshow(simulated_slice.squeeze(0).squeeze(0).detach().cpu().numpy(), cmap='gray')
+    # plt.title("Simulated bSSFP Slice")
+    
+    # os.makedirs("test", exist_ok=True)
+    # plt.savefig(os.path.join("test", "bssfp_simulation_check.png"))
+    # print(f"Saved bSSFP simulation check image")
+
+    # # simulate single training step
+    # gen = GeneratorModel(**asdict(config.gen_model))
+    # discr = DiscriminatorModel(**asdict(config.discr_model))
+    # opt_G = torch.optim.Adam(gen.parameters(), lr=config.lr_gen)
+    # opt_D = torch.optim.Adam(discr.parameters(), lr=config.lr_discr)
     # trainer = GANTrainer(config, gen, discr, bssfp_simulator, opt_G, opt_D, None, None, accelerator)
     # metrics = trainer.train_step(sample)
+    # print(f'train step completed: {metrics}')
 

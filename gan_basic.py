@@ -53,22 +53,24 @@ class DiscriminatorModel(nn.Module):
         self.conv3 = ConvNormAct(base_ch*2, base_ch*4, kernel_size=3, stride=2, padding=1, norm=nn.BatchNorm2d, act=nn.GELU)
         self.conv4 = ConvNormAct(base_ch*4, base_ch*8, kernel_size=3, stride=2, padding=1, norm=nn.BatchNorm2d, act=nn.GELU)
 
-        self.ap = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(base_ch*8, 1)
-        self.final_conv = nn.Conv2d(base_ch*8, 1, kernel_size=3, stride=1, padding=1)
-
+        if  self.use_fc:
+            self.ap = nn.AdaptiveAvgPool2d((1, 1))
+            self.fc = nn.Linear(base_ch*8, 1)
+        else:
+            self.final_conv = nn.Conv2d(base_ch*8, 1, kernel_size=3, stride=1, padding=1)
+    
     def forward(self, x):
-        x = self.conv1(x)
-        x = self.conv2(x)
-        x = self.conv3(x)
-        x = self.conv4(x)
+        x1 = self.conv1(x)
+        x2 = self.conv2(x1)
+        x3 = self.conv3(x2)
+        x4 = self.conv4(x3)
 
         if self.use_fc:
-            x = self.ap(x)
-            x = x.view(x.shape[0], -1)
-            out = self.fc(x)
+            x5 = self.ap(x4)
+            x6 = x5.view(x5.shape[0], -1)
+            out = self.fc(x6)
         else:
-            out = self.final_conv(x)
+            out = self.final_conv(x4)
 
         return out
 
