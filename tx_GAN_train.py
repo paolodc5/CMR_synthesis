@@ -99,8 +99,8 @@ def main():
 
     bssfp_sim = bSSFPSimulator(config.bssfp_model)
     
-    opt_G = torch.optim.Adam(gen.parameters(), lr=config.lr_gen)
-    opt_D = torch.optim.Adam(discr.parameters(), lr=config.lr_discr)
+    opt_G = torch.optim.AdamW(gen.parameters(), lr=config.lr_gen)
+    opt_D = torch.optim.AdamW(discr.parameters(), lr=config.lr_discr)
     
     # opt_G = torch.optim.Adam(gen.parameters(), lr=config.lr)
 
@@ -143,7 +143,7 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        logger.exception("Il training è crashato con il seguente errore:")
+        logger.exception("Training crashed with the following error:")
         sys.exit(1)
     
     

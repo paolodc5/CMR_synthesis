@@ -65,23 +65,28 @@ class GANTrainer:
         with self.accelerator.accumulate(self.discr):
             self.opt_D.zero_grad()
 
-            self.gen.eval()
-            with torch.no_grad():
-                pred_offsets_detached = self.gen(condition)
+            if self.global_step > self.config.warmup_steps_gen:
+                self.gen.eval()
+                with torch.no_grad():
+                    pred_offsets_detached = self.gen(condition)
 
-            real_pair = torch.cat([condition, gt_offsets], dim=1)
-            fake_pair = torch.cat([condition, pred_offsets_detached], dim=1)
-            
-            combined_pair = torch.cat([real_pair, fake_pair], dim=0) # this is necessary for distributed training
-            d_combined = self.discr(combined_pair)
-            d_real, d_fake = torch.split(d_combined, real_pair.shape[0])
-            
-            loss_D_real = self.criterion_GAN(d_real, torch.ones_like(d_real))
-            loss_D_fake = self.criterion_GAN(d_fake, torch.zeros_like(d_fake))
-            loss_D = (loss_D_real + loss_D_fake) * 0.5
-            
-            self.accelerator.backward(loss_D)
-            self.opt_D.step()
+                real_pair = torch.cat([condition, gt_offsets], dim=1)
+                fake_pair = torch.cat([condition, pred_offsets_detached], dim=1)
+                
+                combined_pair = torch.cat([real_pair, fake_pair], dim=0) # this is necessary for distributed training
+                d_combined = self.discr(combined_pair)
+                d_real, d_fake = torch.split(d_combined, real_pair.shape[0])
+                
+                loss_D_real = self.criterion_GAN(d_real, torch.ones_like(d_real))
+                loss_D_fake = self.criterion_GAN(d_fake, torch.zeros_like(d_fake))
+                loss_D = (loss_D_real + loss_D_fake) * 0.5
+                
+                # if self.accelerator.sync_gradients:
+                #     self.accelerator.clip_grad_norm_(self.discr.parameters(), max_norm=1.0)
+                self.accelerator.backward(loss_D)
+                self.opt_D.step()
+            else:
+                loss_D = torch.tensor(0.0, device=self.accelerator.device)
 
         # train generator
         self.gen.train()
@@ -110,6 +115,8 @@ class GANTrainer:
             
             loss_G = loss_G_adv + (10.0 * loss_G_prop) + (self.config.lambda_physics * loss_G_phys)
             
+            # if self.accelerator.sync_gradients:
+            #     self.accelerator.clip_grad_norm_(self.gen.parameters(), max_norm=1.0)
             self.accelerator.backward(loss_G)
             self.opt_G.step()
 
@@ -203,7 +210,7 @@ class GANTrainer:
         self.logger.info("Extracting the fixed validation batch for logging...")
         
         # target_batch_idx = len(self.val_loader) // 2+70 # choose a "middle batch" for validation
-        target_batch_idx = 360
+        target_batch_idx = 350
         self.fixed_val_batch = 0
         for i, batch in enumerate(self.val_loader):
             if i == target_batch_idx:

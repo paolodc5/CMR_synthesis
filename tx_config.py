@@ -51,12 +51,13 @@ class GANTrainerConfig:
 
     val_fraction: float = 0.2
     num_epochs: int = 100
-    lr_gen: float = 5e-4
+    lr_gen: float = 1e-4
     lr_discr: float = 1e-5
     lambda_properties: float = 10.0
     lambda_physics: float = 5.0 # Peso per la loss valutata sull'immagine generata
+    warmup_steps_gen: int = 500
 
-    mixed_precision: str = 'fp16'
+    mixed_precision: str = 'fp16'  # 'no', 'fp16', or 'bf16' 
     log_image_epochs = 1
 
     seed: int = 187
