@@ -73,7 +73,7 @@ PROPERTY_KEY = {
     "skin": [65.19, 900.0, 20.0], # (ITIS, T1 and T2 are estimated from derma values in Richard et al, 1991)
     "others": [71.0, 250.0, 20.0], # from Buoso
     "background_air": [0.01, 750.0, 60.0], # from Buoso
-    "trachea": [60.00, 1045.5, 37.3]
+    "trachea": [60.00, 1045.5, 37.3] # (ITIS)
 }
 # "cartilage": [71.77, 1045.5, 37.3], # (ITIS)
 
