@@ -1,14 +1,17 @@
+import argparse
 import os
 import sys
 import json
 import numpy as np
 from dataclasses import asdict
 from sklearn.model_selection import train_test_split
+import argparse
 
 import torch
 from torch.utils.data import DataLoader
 from accelerate import Accelerator
 from accelerate.logging import get_logger
+from tqdm import tqdm
 
 from datasets import FastDatasetDIDC
 from utils import setup_logger, set_reproducibility
@@ -25,8 +28,9 @@ logger = get_logger(__name__, log_level="INFO")
 
 
 class CustomDatasetTexturizer(FastDatasetDIDC):
-    def __init__(self, data_path: str, file_list: list[str]=None):
+    def __init__(self, data_path: str, file_list: list[str]=None, global_scale: float = 1.0):
         super().__init__(data_path=data_path, file_list=file_list)
+        self.global_scale = global_scale
 
     def __getitem__(self, idx):
         # load the original sample and take only the mask
@@ -39,21 +43,50 @@ class CustomDatasetTexturizer(FastDatasetDIDC):
         props_path = os.path.join(self.data_path, f"{pat_id}_props.npy")
 
         mri_slice = np.load(pat_path, mmap_mode='r')[slice_idx]
-
         try: 
             props_slice = np.load(props_path, mmap_mode='r')[slice_idx] # if slices are the first dimension
         except IndexError:
             props_slice = np.load(props_path, mmap_mode='r')[..., slice_idx]
 
-        mri_slice_tensor = torch.from_numpy(mri_slice.copy()).float()
+        mri_slice_tensor = torch.from_numpy(mri_slice.copy() / self.global_scale).float()
         props_slice_tensor = torch.from_numpy(props_slice.copy()).float()
 
         return {'input_label': label, 'mri_slice': mri_slice_tensor, 'props_slice': props_slice_tensor}
 
 
+def compute_mean_99th_perc_scale(dataset, max_samples=5000):
+    percentiles = []
+    
+    indices = np.random.choice(len(dataset), min(len(dataset), max_samples), replace=False)
+
+    for idx in tqdm(indices, desc="Compute 99th perc. slices"):
+        mri_slice = dataset[idx]['mri_slice'].numpy()
+        no_bkg_pixels = mri_slice[mri_slice > 1e-3]
+
+        if len(no_bkg_pixels) > 0:
+            perc_99 = np.percentile(no_bkg_pixels, 99)
+            percentiles.append(perc_99)
+
+    return float(np.mean(percentiles))
+
+
 def main():
-    config = GANTrainerConfig()
-    # config = UnetTrainerConfig()
+
+    parser = argparse.ArgumentParser(description="Training Pipeline per UNet e GAN")
+    parser.add_argument(
+        '--mode', 
+        type=str, 
+        required=True, 
+        choices=['unet', 'gan'], 
+        help="Choose which model to train: 'unet' or 'gan'"
+    )
+    args = parser.parse_args()
+
+    if args.mode == 'gan':
+        config = GANTrainerConfig()
+    else:
+        config = UnetTrainerConfig()
+
     set_reproducibility(config.seed)
     
     accelerator = Accelerator(
@@ -67,7 +100,9 @@ def main():
         os.makedirs(config.run_dir, exist_ok=True)
         setup_logger(config.run_dir)
         accelerator.init_trackers("tb_tracker")
-    
+
+    logger.info(f"Initialized {args.mode} training")
+
     dataset_config_path = os.path.join(config.data_path, "dataset_config.json")
     config_properties_path = os.path.join(config.data_path, "config_properties.json")
     if os.path.exists(dataset_config_path) and os.path.exists(config_properties_path):
@@ -80,7 +115,19 @@ def main():
 
     all_files = sorted(list(set([f.replace('_props.npy', '') for f in os.listdir(config.data_path) if f.endswith('props.npy')])))
     train_files, val_files = train_test_split(all_files, test_size=config.val_fraction, random_state=config.seed)
-    
+
+    train_dataset = CustomDatasetTexturizer(data_path=config.data_path, file_list=train_files)
+    val_dataset = CustomDatasetTexturizer(data_path=config.data_path, file_list=val_files)
+    train_loader = DataLoader(train_dataset, batch_size=config.batch_size_per_gpu, shuffle=True, num_workers=config.num_workers)
+    val_dataloader = DataLoader(val_dataset, batch_size=config.batch_size_per_gpu, shuffle=False, num_workers=config.num_workers)
+
+    logger.info(f"Computing mri slices scale factor (99th percentile) on {min(len(train_dataset), config.max_sample_statistics)} slices")
+    global_scale = compute_mean_99th_perc_scale(train_dataset, max_samples=config.max_sample_statistics)
+    train_dataset.global_scale = global_scale
+    val_dataset.global_scale = global_scale
+    config.global_scale = global_scale
+    logger.info(f"Computed global scale factor for MRI slices: {global_scale:.4f}")
+
     if accelerator.is_main_process:
         with open(f"{config.run_dir}/train_val_split.json", "w") as f:
             json.dump({'train_indices': train_files, 'val_indices': val_files}, f, indent=4)
@@ -89,53 +136,51 @@ def main():
         with open(f"{config.run_dir}/training_config.json", "w") as f:
             json.dump({**asdict(config), **dataset_config, **properties_config}, f, indent=4)
 
-    train_dataset = CustomDatasetTexturizer(data_path=config.data_path, file_list=train_files)
-    val_dataset = CustomDatasetTexturizer(data_path=config.data_path, file_list=val_files)
-    train_loader = DataLoader(train_dataset, batch_size=config.batch_size_per_gpu, shuffle=True, num_workers=config.num_workers)
-    val_dataloader = DataLoader(val_dataset, batch_size=config.batch_size_per_gpu, shuffle=False, num_workers=config.num_workers)
-
-    gen = GeneratorModel(**asdict(config.gen_model)) # input channels: 1 or 22
-    discr = DiscriminatorModel(**asdict(config.discr_model)) # 4 channels: (1 condition + 3 offset)
-
     bssfp_sim = bSSFPSimulator(config.bssfp_model)
-    
-    opt_G = torch.optim.AdamW(gen.parameters(), lr=config.lr_gen)
-    opt_D = torch.optim.AdamW(discr.parameters(), lr=config.lr_discr)
-    
-    # opt_G = torch.optim.Adam(gen.parameters(), lr=config.lr)
 
-    gen, discr, opt_G, opt_D, train_loader, val_dataloader, bssfp_sim = accelerator.prepare(
-        gen, discr, opt_G, opt_D, train_loader, val_dataloader, bssfp_sim
-    )
-    
-    trainer = GANTrainer(
-        config=config,
-        gen=gen,
-        discr=discr,
-        bssfp_sim=bssfp_sim,
-        opt_G=opt_G,
-        opt_D=opt_D,
-        train_loader=train_loader,
-        val_loader=val_dataloader,
-        accelerator=accelerator,
-        logger=logger
-    )
+    if args.mode == 'gan':
+        gen = GeneratorModel(**asdict(config.gen_model)) # input channels: 1 or 22
+        discr = DiscriminatorModel(**asdict(config.discr_model)) # 4 channels: (1 condition + 3 offset)
 
-    # gen, opt_G, train_loader, val_dataloader, bssfp_sim = accelerator.prepare(
-    #     gen, opt_G, train_loader, val_dataloader, bssfp_sim
-    # )
-
-    # trainer = UnetTrainer(
-    #     config=config,
-    #     model=gen,
-    #     bssfp_sim=bssfp_sim,
-    #     opt=opt_G,
-    #     train_loader=train_loader,
-    #     val_loader=val_dataloader,
-    #     accelerator=accelerator,
-    #     logger=logger
-    # )
+        opt_G = torch.optim.AdamW(gen.parameters(), lr=config.lr_gen)
+        opt_D = torch.optim.AdamW(discr.parameters(), lr=config.lr_discr)
+ 
+        gen, discr, opt_G, opt_D, train_loader, val_dataloader, bssfp_sim = accelerator.prepare(
+            gen, discr, opt_G, opt_D, train_loader, val_dataloader, bssfp_sim
+        )
+        
+        trainer = GANTrainer(
+            config=config,
+            gen=gen,
+            discr=discr,
+            bssfp_sim=bssfp_sim,
+            opt_G=opt_G,
+            opt_D=opt_D,
+            train_loader=train_loader,
+            val_loader=val_dataloader,
+            accelerator=accelerator,
+            logger=logger
+        )
     
+    if args.mode == 'unet':
+        model = GeneratorModel(**asdict(config.gen_model)) # input channels: 1 or 22
+        opt_G = torch.optim.Adam(model.parameters(), lr=config.lr)
+
+        model, opt_G, train_loader, val_dataloader, bssfp_sim = accelerator.prepare(
+            model, opt_G, train_loader, val_dataloader, bssfp_sim
+        )
+
+        trainer = UnetTrainer(
+            config=config,
+            model=model,
+            bssfp_sim=bssfp_sim,
+            opt=opt_G,
+            train_loader=train_loader,
+            val_loader=val_dataloader,
+            accelerator=accelerator,
+            logger=logger
+        )
+        
     trainer.train()
 
 

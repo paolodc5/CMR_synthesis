@@ -38,7 +38,7 @@ class GeneratorConfig:
 
 @dataclass
 class GANTrainerConfig:
-    run_name: str = "texturizer_GAN_train"
+    run_name: str = "texturizer_GAN_train_L2reg_gs"
     exp_dir: str = "./experiments/DIDCV2_TEXT"
     
     data_path: str = "./DIDC_multiclass_coro_v2_prep_2"
@@ -54,15 +54,19 @@ class GANTrainerConfig:
     lr_gen: float = 1e-4
     lr_discr: float = 1e-5
     lambda_properties: float = 10.0
-    lambda_physics: float = 5.0 # Peso per la loss valutata sull'immagine generata
+    lambda_physics: float = 5.0
+    lambda_reg: float = 0.1 
     warmup_steps_gen: int = 500
+
+    max_sample_statistics: int = 5000 # max number of samples to compute the 99th percentile scale factor for normalization
+    global_scale: float = 1.0 # placeholder
 
     mixed_precision: str = 'fp16'  # 'no', 'fp16', or 'bf16' 
     log_image_epochs = 1
 
     seed: int = 187
     run_dir: str = ''
-    notes: str = "Training GAN with higher lr for generator"
+    notes: str = "Training GAN with higher lr for generator and L2 regularization on offsets"
     gradient_accumulation_steps: int = 1
 
     bssfp_model: BSSFPConfig = field(default_factory=BSSFPConfig)
@@ -78,7 +82,7 @@ class GANTrainerConfig:
 
 @dataclass
 class UnetTrainerConfig:
-    run_name: str = "texturizer_UNet_train"
+    run_name: str = "texturizer_UNet_train_L2reg"
     exp_dir: str = "./experiments/DIDCV2_TEXT"
     
     data_path: str = "./DIDC_multiclass_coro_v2_prep_2"
@@ -94,11 +98,15 @@ class UnetTrainerConfig:
 
     lambda_prop: float = 10.0   
     lambda_physics: float = 5.0
+    lambda_reg: float = 0.1
+
+    max_sample_statistics: int = 5000 # max number of samples to compute the 99th percentile scale factor for normalization
+    global_scale: float = 1.0 # placeholder
 
     mixed_precision: str = "fp16"
     log_image_epochs = 1
     seed: int = 187
-    notes: str = "Training UNet with reconstruction loss (physics and property)"
+    notes: str = "Training UNet with reconstruction loss (physics and property) with L2 regularization on offsets"
     run_dir: str = ""
     gradient_accumulation_steps: int = 1
 

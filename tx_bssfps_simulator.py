@@ -43,7 +43,7 @@ class bSSFPSimulator(nn.Module):
             dtype=torch.float32
         ).view(1, 3, 1, 1) # reshape for broadcasting
         
-        absolute_props_norm = absolute_props / max_vals
+        absolute_props_norm = absolute_props / max_vals # normalize absolute properties to [0,1] range for the network
         offsets = absolute_props_norm - init_props
         
         return offsets

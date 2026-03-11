@@ -81,8 +81,6 @@ class GANTrainer:
                 loss_D_fake = self.criterion_GAN(d_fake, torch.zeros_like(d_fake))
                 loss_D = (loss_D_real + loss_D_fake) * 0.5
                 
-                # if self.accelerator.sync_gradients:
-                #     self.accelerator.clip_grad_norm_(self.discr.parameters(), max_norm=1.0)
                 self.accelerator.backward(loss_D)
                 self.opt_D.step()
             else:
@@ -112,11 +110,13 @@ class GANTrainer:
             # Physics Loss (L1 on bSSFP simulated image vs real MRI)
             pred_img = self.bssfp_sim(pred_offsets, condition)
             loss_G_phys = self.criterion_L1(pred_img, gt_mri)
+
+            # offset L2 regularization
+            PD_offset, T1_offset, T2_offset = pred_offsets[:, 0, ...], pred_offsets[:, 1, ...], pred_offsets[:, 2, ...]            
+            loss_reg = torch.mean(PD_offset**2) + torch.mean(T1_offset**2) + torch.mean(T2_offset**2)
+
+            loss_G = loss_G_adv + (10.0 * loss_G_prop) + (self.config.lambda_physics * loss_G_phys) + (self.config.lambda_reg * loss_reg)
             
-            loss_G = loss_G_adv + (10.0 * loss_G_prop) + (self.config.lambda_physics * loss_G_phys)
-            
-            # if self.accelerator.sync_gradients:
-            #     self.accelerator.clip_grad_norm_(self.gen.parameters(), max_norm=1.0)
             self.accelerator.backward(loss_G)
             self.opt_G.step()
 
@@ -128,6 +128,7 @@ class GANTrainer:
             "Train/loss_G_adv": loss_G_adv.item(),
             "Train/loss_G_prop": loss_G_prop.item(),
             "Train/loss_G_phys": loss_G_phys.item(),
+            "Train/loss_G_reg": loss_reg.item(),
             "Train/current_epoch": self.global_step // len(self.train_loader),
             "Train/SSIM": ssim,
             "Train/PSNR": psnr
@@ -145,6 +146,7 @@ class GANTrainer:
             "loss_G_adv": 0.0, 
             "loss_G_prop": 0.0, 
             "loss_G_phys": 0.0, 
+            "loss_G_reg": 0.0,
             "SSIM": 0.0, 
             "PSNR": 0.0
         }
@@ -181,9 +183,13 @@ class GANTrainer:
             loss_G_adv = self.criterion_GAN(d_fake, torch.ones_like(d_fake))
             loss_G_prop = self.criterion_L1(pred_offsets, gt_offsets)
             loss_G_phys = self.criterion_L1(pred_img, gt_mri)
-            
-            loss_G = loss_G_adv + (self.config.lambda_properties * loss_G_prop) + (self.config.lambda_physics * loss_G_phys)
-            
+
+            # offset L2 regularization
+            PD_offset, T1_offset, T2_offset = pred_offsets[:, 0, ...], pred_offsets[:, 1, ...], pred_offsets[:, 2, ...]            
+            val_loss_reg = torch.mean(PD_offset**2) + torch.mean(T1_offset**2) + torch.mean(T2_offset**2)
+    
+            loss_G = loss_G_adv + (self.config.lambda_properties * loss_G_prop) + (self.config.lambda_physics * loss_G_phys) + (self.config.lambda_reg * val_loss_reg)
+
             ssim_val, psnr_val = self.evaluator.evaluate(pred_img, gt_mri)
             
             val_metrics["loss_D"] += loss_D.item()
@@ -191,6 +197,7 @@ class GANTrainer:
             val_metrics["loss_G_adv"] += loss_G_adv.item()
             val_metrics["loss_G_prop"] += loss_G_prop.item()
             val_metrics["loss_G_phys"] += loss_G_phys.item()
+            val_metrics["loss_G_reg"] += val_loss_reg.item()
             val_metrics["SSIM"] += ssim_val
             val_metrics["PSNR"] += psnr_val
 
@@ -208,9 +215,8 @@ class GANTrainer:
 
     def train(self):
         self.logger.info("Extracting the fixed validation batch for logging...")
-        
-        # target_batch_idx = len(self.val_loader) // 2+70 # choose a "middle batch" for validation
-        target_batch_idx = 350
+                
+        target_batch_idx = 7
         self.fixed_val_batch = 0
         for i, batch in enumerate(self.val_loader):
             if i == target_batch_idx:
@@ -335,7 +341,11 @@ class UnetTrainer:
             
             loss_phys = self.criterion_L1(pred_img, gt_mri)
 
-            loss_total = (self.config.lambda_prop * loss_prop) + (self.config.lambda_physics * loss_phys)
+            # offset L2 regularization
+            PD_offset, T1_offset, T2_offset = pred_offsets[:, 0, ...], pred_offsets[:, 1, ...], pred_offsets[:, 2, ...]            
+            loss_reg = torch.mean(PD_offset**2) + torch.mean(T1_offset**2) + torch.mean(T2_offset**2)
+            
+            loss_total = (self.config.lambda_prop * loss_prop) + (self.config.lambda_physics * loss_phys) + (self.config.lambda_reg * loss_reg)
 
             self.accelerator.backward(loss_total)
             self.opt.step()
@@ -346,6 +356,7 @@ class UnetTrainer:
             "Train/loss_total": loss_total.item(),
             "Train/loss_prop": loss_prop.item(),
             "Train/loss_phys": loss_phys.item(),
+            "Train/loss_reg": loss_reg.item(),
             "Train/SSIM": ssim,
             "Train/PSNR": psnr,
             "Train/current_epoch": self.global_step // len(self.train_loader)
@@ -383,13 +394,17 @@ class UnetTrainer:
             
             loss_phys = self.criterion_L1(pred_img, gt_mri)
 
-            loss_total = (self.config.lambda_prop * loss_prop) + (self.config.lambda_physics * loss_phys)
+            PD_offset, T1_offset, T2_offset = pred_offsets[:, 0, ...], pred_offsets[:, 1, ...], pred_offsets[:, 2, ...]            
+            val_loss_reg = torch.mean(PD_offset**2) + torch.mean(T1_offset**2) + torch.mean(T2_offset**2)
+
+            loss_total = (self.config.lambda_prop * loss_prop) + (self.config.lambda_physics * loss_phys) + (self.config.lambda_reg * val_loss_reg)
             
             ssim_val, psnr_val = self.evaluator.evaluate(pred_img, gt_mri)
             
             val_loss_total += loss_total.item()
             val_loss_prop += loss_prop.item()
             val_loss_phys += loss_phys.item()
+            val_loss_reg += val_loss_reg.item()
             val_ssim += ssim_val
             val_psnr += psnr_val
 
@@ -398,6 +413,7 @@ class UnetTrainer:
             "Val/loss_total": val_loss_total / num_batches,
             "Val/loss_prop": val_loss_prop / num_batches,
             "Val/loss_phys": val_loss_phys / num_batches,
+            "Val/loss_reg": val_loss_reg / num_batches,
             "Val/SSIM": val_ssim / num_batches,
             "Val/PSNR": val_psnr / num_batches,
         }
