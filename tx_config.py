@@ -82,7 +82,7 @@ class GANTrainerConfig:
 
 @dataclass
 class UnetTrainerConfig:
-    run_name: str = "texturizer_UNet_train_L2reg"
+    run_name: str = "texturizer_UNet_train_L2reg_gs"
     exp_dir: str = "./experiments/DIDCV2_TEXT"
     
     data_path: str = "./DIDC_multiclass_coro_v2_prep_2"
@@ -106,7 +106,7 @@ class UnetTrainerConfig:
     mixed_precision: str = "fp16"
     log_image_epochs = 1
     seed: int = 187
-    notes: str = "Training UNet with reconstruction loss (physics and property) with L2 regularization on offsets"
+    notes: str = "Training UNet with reconstruction loss (physics and property) with L2 regularization on offsets, MR scale included"
     run_dir: str = ""
     gradient_accumulation_steps: int = 1
 
