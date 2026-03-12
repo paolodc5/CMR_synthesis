@@ -102,7 +102,7 @@ def create_mmap_dataset(source_dir, dest_dir, save_images=False):
 
 if __name__ == "__main__":
     source_dir = 'DIDC_multiclass_coro_v2'
-    dest_dir = 'DIDC_multiclass_coro_v2_prep_2'
+    dest_dir = 'DIDC_multiclass_coro_v2_prep_3'
     save_images = True
     create_mmap_dataset(source_dir, dest_dir, save_images)
     

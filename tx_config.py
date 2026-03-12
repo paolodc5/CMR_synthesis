@@ -55,7 +55,7 @@ class GANTrainerConfig:
     lr_discr: float = 1e-5
     lambda_properties: float = 10.0
     lambda_physics: float = 5.0
-    lambda_reg: float = 0.1 
+    lambda_reg: float = 1 
     warmup_steps_gen: int = 500
 
     max_sample_statistics: int = 5000 # max number of samples to compute the 99th percentile scale factor for normalization
@@ -66,7 +66,7 @@ class GANTrainerConfig:
 
     seed: int = 187
     run_dir: str = ''
-    notes: str = "Training GAN with higher lr for generator and L2 regularization on offsets"
+    notes: str = "Training GAN with higher lr for generator and L2 regularization on offsets, higher weight for regularization loss (from 0.1 to 1), MR scale included"
     gradient_accumulation_steps: int = 1
 
     bssfp_model: BSSFPConfig = field(default_factory=BSSFPConfig)

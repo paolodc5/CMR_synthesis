@@ -21,7 +21,7 @@ from utils import load_original_labels, setup_logger, set_reproducibility
 @dataclass
 class Config:
     data_dir: str = './DIDC_multiclass_coro_v2_prep_2'
-    out_dir: str = './DIDC_multiclass_coro_v2_prep_2'
+    out_dir: str = './DIDC_multiclass_coro_v2_prep_3'
     
     epochs: int = 500
     lr: float = 0.001
@@ -31,7 +31,18 @@ class Config:
     PD_max: float = 200.0
     T1_max: float = 2000.0
     T2_max: float = 500.0
+    TR: float = 3.0
+    TE: float = 1.5
+    flip_angle: float = 0.6
+    
     upsample_factor: int = 1
+
+    lambda_reg: float = 0.01
+    lambda_pd: float = 10000
+    lambda_t1: float = 0.1
+    lambda_t2: float = 0.01
+
+    batch_size = 64
 
     save_hd_images: bool = False
     slices_first: bool = True
@@ -44,10 +55,10 @@ class Config:
 
 
 class offsetNet(nn.Module):
-    def __init__(self, target_size=(384, 384)):
+    def __init__(self, batch_size, target_size=(384, 384)):
         super(offsetNet, self).__init__()
-        self.offsets = nn.Parameter(torch.zeros(1, 3, target_size[0], target_size[1])) 
-        self.scale_param = nn.Parameter(torch.zeros(1))
+        self.offsets = nn.Parameter(torch.zeros(batch_size, 3, target_size[0], target_size[1])) 
+        self.scale_param = nn.Parameter(torch.zeros(batch_size, 1, 1))
 
     def forward(self):
         return self.offsets, torch.tanh(self.scale_param)
@@ -66,7 +77,8 @@ class PropertyGenerator:
                  label2label_old: dict = None,
                  pat_id: str = None,
                  save_images: bool = False,
-                 slices_first: bool = True):
+                 slices_first: bool = True,
+                 config: Config = None):
         if device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:
@@ -75,7 +87,7 @@ class PropertyGenerator:
         self.epochs = epochs
         self.lr = lr
 
-        self.PD_max, self.T1_max, self.T2_max = 200., 2000., 500.
+        self.PD_max, self.T1_max, self.T2_max = config.PD_max, config.T1_max, config.T2_max
 
         self.TR = 3.0
         self.TE = 1.5
@@ -98,17 +110,20 @@ class PropertyGenerator:
         self.save_images = save_images
         self.slices_first = slices_first
 
+        self.config = config
+
     def _initialize_tissue_maps(self, mask):
         """Creates initial tissue starting from the mask"""
-        h, w = mask.shape
-        init_prop = np.zeros((1, 3, h, w), dtype=np.float32)
+        b, h, w = mask.shape
+        init_prop = np.zeros((b, 3, h, w), dtype=np.float32)
         
         for old_label, new_label in self.label2label.items():
-            ix, iy = np.where(mask == self.label2idx.index(old_label))
-            if len(ix) > 0:
-                init_prop[0, 0, ix, iy] = self.properties_keys[new_label][0] / self.PD_max
-                init_prop[0, 1, ix, iy] = self.properties_keys[new_label][1] / self.T1_max
-                init_prop[0, 2, ix, iy] = self.properties_keys[new_label][2] / self.T2_max
+            label_idx = self.label2idx.index(old_label)
+            ix = (mask == label_idx)            
+            if ix.any():
+                init_prop[:, 0][ix] = self.properties_keys[new_label][0] / self.PD_max
+                init_prop[:, 1][ix] = self.properties_keys[new_label][1] / self.T1_max
+                init_prop[:, 2][ix] = self.properties_keys[new_label][2] / self.T2_max
                 
         return torch.tensor(init_prop, dtype=torch.float32, device=self.device)
 
@@ -130,27 +145,31 @@ class PropertyGenerator:
         """Error computation with L2 regularization on tissue property offsets."""
         PD_offset, T1_offset, T2_offset = offset[:, 0, ...], offset[:, 1, ...], offset[:, 2, ...]
         
-        recon_error = torch.mean((predicted_img - target_img)**2)
+        recon_error = torch.mean((predicted_img - target_img)**2, dim=(1,2))
         # L2 reg
-        tissue_reg = torch.mean(PD_offset**2) * 10000 + 0.1 * torch.mean(T1_offset**2) + 0.01 * torch.mean(T2_offset**2)
+        tissue_reg = (torch.mean(PD_offset**2, dim=(1, 2)) * self.config.lambda_pd + 
+                      torch.mean(T1_offset**2, dim=(1, 2)) * self.config.lambda_t1 + 
+                      torch.mean(T2_offset**2, dim=(1, 2)) * self.config.lambda_t2)
         
-        return recon_error + (tissue_reg * 0.001)
+        return recon_error + (tissue_reg * self.config.lambda_reg)
 
-    def fit_slice(self, mri_slice, label_slice, slice_idx, total_slices):
-        """Actual optimization for a single 2D slice."""
-        target_size = mri_slice.shape
-        target_image = torch.tensor(mri_slice, dtype=torch.float32, device=self.device)
-        init_tissue_properties = self._initialize_tissue_maps(label_slice)
+    def fit_batch(self, mri_batch, label_batch, start_idx, end_idx):
+        b, h, w = mri_batch.shape
+        target_image = torch.tensor(mri_batch, dtype=torch.float32, device=self.device)
+        init_tissue_properties = self._initialize_tissue_maps(label_batch)
         
-        # Optimization setup
-        onet = offsetNet(target_size=target_size).to(self.device)
+        onet = offsetNet(batch_size=b, target_size=(h, w)).to(self.device)
         optimizer = optim.Adam(onet.parameters(), lr=self.lr)
 
         onet.train()
-        epoch_iter = tqdm(range(self.epochs), desc=f'Fitting Slice {slice_idx}/{total_slices}', leave=False)
+        epoch_iter = tqdm(range(self.epochs), desc=f'Fitting Slices {start_idx}-{end_idx}', leave=False)
         
-        best_loss = float('inf')
-        epochs_no_improve = 0
+        # Vectorizing the early stopping (to trigger independently on each slice)
+        best_loss = torch.full((b,), float('inf'), device=self.device)
+        epochs_no_improve = torch.zeros(b, dtype=torch.int32, device=self.device)
+        
+        best_offsets = torch.zeros_like(onet.offsets)
+        best_scale = torch.zeros_like(onet.scale_param)
 
         for epoch in epoch_iter:
             optimizer.zero_grad()
@@ -158,38 +177,46 @@ class PropertyGenerator:
             tissue_offsets, scale_mag = onet()
             predicted_img = self._bssfp_signal_model(tissue_offsets, init_tissue_properties) * (1 + scale_mag)
             
-            loss = self._loss_fn(target_image, predicted_img, tissue_offsets)
-            loss.backward()
+            loss_per_slice = self._loss_fn(target_image, predicted_img, tissue_offsets)
+            
+            loss_mean = loss_per_slice.mean()
+            loss_mean.backward()
             optimizer.step()
 
-            if loss.item() < best_loss - self.min_delta:
-                best_loss = loss.item()
-                epochs_no_improve = 0
-                best_offsets = tissue_offsets
-                best_scale = scale_mag
-            else:
-                epochs_no_improve += 1
+            #  independent update logic
+            improved_mask = loss_per_slice < (best_loss - self.min_delta)
             
-            if epochs_no_improve >= self.patience:
-                tissue_offsets = best_offsets
-                scale_mag = best_scale
+            if improved_mask.any():
+                best_loss[improved_mask] = loss_per_slice[improved_mask].detach()
+                best_offsets[improved_mask] = tissue_offsets[improved_mask].detach().clone() # saves the best offests and discards the rest
+                best_scale[improved_mask] = scale_mag[improved_mask].detach().clone()
+            
+            epochs_no_improve[improved_mask] = 0
+            epochs_no_improve[~improved_mask] += 1
+            
+            if (epochs_no_improve >= self.patience).all():
                 break
             
             if epoch % 50 == 0:
-                epoch_iter.set_postfix_str("loss=%.4g" % loss.item())
+                epoch_iter.set_postfix_str("loss_mean=%.4g" % loss_mean.item())
                 
-        final_offsets = tissue_offsets.detach()
-        final_scale = scale_mag.detach()
+        uninitialized = (best_loss == float('inf'))
+        if uninitialized.any():
+            best_offsets[uninitialized] = tissue_offsets[uninitialized].detach()
+            best_scale[uninitialized] = scale_mag[uninitialized].detach()
+            
+        final_props = torch.zeros_like(best_offsets)
+        final_props[:, 0] = torch.clamp(best_offsets[:, 0] + init_tissue_properties[:, 0], 0.001, 50) * self.PD_max
+        final_props[:, 1] = torch.clamp(best_offsets[:, 1] + init_tissue_properties[:, 1], 0.001, 50) * self.T1_max
+        final_props[:, 2] = torch.clamp(best_offsets[:, 2] + init_tissue_properties[:, 2], 0.001, 50) * self.T2_max
         
-        final_props = torch.zeros_like(final_offsets)
-        final_props[0, 0] = torch.clamp(final_offsets[0, 0] + init_tissue_properties[0, 0], 0.001, 50) * self.PD_max
-        final_props[0, 1] = torch.clamp(final_offsets[0, 1] + init_tissue_properties[0, 1], 0.001, 50) * self.T1_max
-        final_props[0, 2] = torch.clamp(final_offsets[0, 2] + init_tissue_properties[0, 2], 0.001, 50) * self.T2_max
+        final_img = self._bssfp_signal_model(best_offsets, init_tissue_properties) * (1 + best_scale)
         
-        return final_props[0].cpu().numpy(), predicted_img[0].detach().cpu().numpy(), init_tissue_properties[0].cpu().numpy(), final_scale.detach().cpu().numpy(), best_loss, epoch
-
+        # Restituiamo la loss media dei "best" giusto per logging
+        return final_props.cpu().numpy(), final_img.detach().cpu().numpy(), init_tissue_properties.cpu().numpy(), best_scale.detach().cpu().numpy(), best_loss.mean().item(), epoch
+    
     def process_volume(self, mri_volume, labels_volume, out_path, upsample_factor=4):
-        """Handles the entire 3D volume: Upsampling, Fitting slice by slice, and Saving."""
+        """Handles the entire 3D volume using mini-batches."""
         mri_hd = scipy.ndimage.zoom(mri_volume, (1, upsample_factor, upsample_factor), order=1)
         labels_hd = scipy.ndimage.zoom(labels_volume, (1, upsample_factor, upsample_factor), order=0)
         
@@ -203,24 +230,38 @@ class PropertyGenerator:
         os.makedirs(os.path.join(out_path, f'simulated_images/{self.pat_id}/'), exist_ok=True)
 
         avg_pat_loss = 0.0
-        for s in range(slices):
-            # Executes optimization
-            props, pred_img, init_props, scale, loss, epoch = self.fit_slice(mri_hd[s], labels_hd[s], slice_idx=s, total_slices=slices)
-            avg_pat_loss += loss
+        batch_size = self.config.batch_size
+        num_batches = int(np.ceil(slices / batch_size))
+
+        for b_idx in range(num_batches):
+            # extract the batch
+            start_idx = b_idx * batch_size
+            end_idx = min((b_idx + 1) * batch_size, slices)
+            
+            mri_batch = mri_hd[start_idx:end_idx]
+            labels_batch = labels_hd[start_idx:end_idx]
+
+            props, pred_img, init_props, scale, loss, epoch = self.fit_batch(
+                mri_batch, labels_batch, start_idx, end_idx
+            )
+            
+            avg_pat_loss += loss * (end_idx - start_idx)
 
             if self.slices_first:
-                tissue_props[s] = props
+                tissue_props[start_idx:end_idx] = props
             else:
-                tissue_props[..., s] = props
+                # (Batch, C, H, W) -> (C, H, W, Batch)
+                tissue_props[..., start_idx:end_idx] = props.transpose(1, 2, 3, 0)
             
-            if s == 120 or s == 180:
-                fig, ax = plt.subplots(1, 2, figsize=(10, 5))
-                ax[0].imshow(mri_hd[s], cmap='gray')
-                ax[0].set_title("Real MRI")
-                ax[1].imshow(pred_img, cmap='gray')
-                ax[1].set_title("Simulated bSSFP")
-                plt.savefig(os.path.join(out_path, f'simulated_images/{self.pat_id}/MRI_{s:05d}.png'), dpi=150)
-                plt.close()
+            for i, absolute_s in enumerate(range(start_idx, end_idx)):
+                if absolute_s in [120, 180]:
+                    fig, ax = plt.subplots(1, 2, figsize=(10, 5))
+                    ax[0].imshow(mri_batch[i], cmap='gray')
+                    ax[0].set_title("Real MRI")
+                    ax[1].imshow(pred_img[i], cmap='gray')
+                    ax[1].set_title("Simulated bSSFP")
+                    plt.savefig(os.path.join(out_path, f'simulated_images/{self.pat_id}/MRI_{absolute_s:05d}.png'), dpi=150)
+                    plt.close()
         
         avg_pat_loss /= slices
         logging.info(f"Patient {self.pat_id}: Average Slice Loss = {avg_pat_loss:.4f}")
@@ -228,7 +269,7 @@ class PropertyGenerator:
         if self.save_images:
             np.save(os.path.join(out_path, f'{self.pat_id}_MRI_matrix_HD.npy'), mri_hd)
             np.save(os.path.join(out_path, f'{self.pat_id}_labels_matrix_HD.npy'), labels_hd)
-        np.save(os.path.join(out_path, f'{self.pat_id}_props.npy'), tissue_props) # shape (3, H, W, S)
+        np.save(os.path.join(out_path, f'{self.pat_id}_props.npy'), tissue_props)
 
 def main():
     config = Config()
@@ -278,9 +319,14 @@ def main():
                                       device=config.device,
                                       save_images=config.save_hd_images,
                                       pat_id=pat_id,
-                                      slices_first=config.slices_first)
+                                      slices_first=config.slices_first, 
+                                      config=config)
         generator.process_volume(mri_volume, labels_volume, config.out_dir, upsample_factor=config.upsample_factor)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        logging.exception("The script crashed with the following error:")
+        sys.exit(1)
