@@ -184,7 +184,7 @@ def setup_logger(log_dir, filename="training.log"):
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
         handlers=[
-            logging.FileHandler(os.path.join(log_dir, filename)),
+            logging.FileHandler(os.path.join(log_dir, filename), mode='w'),
             logging.StreamHandler(sys.stdout)
         ]
     )

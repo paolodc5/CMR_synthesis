@@ -6,6 +6,7 @@ import numpy as np
 from dataclasses import asdict
 from sklearn.model_selection import train_test_split
 import argparse
+import logging
 
 import torch
 from torch.utils.data import DataLoader
@@ -28,9 +29,37 @@ logger = get_logger(__name__, log_level="INFO")
 
 
 class CustomDatasetTexturizer(FastDatasetDIDC):
-    def __init__(self, data_path: str, file_list: list[str]=None, global_scale: float = 1.0):
+    def __init__(self, data_path: str, logger: logging.Logger, file_list: list[str]=None, global_scale: float = 1.0):
         super().__init__(data_path=data_path, file_list=file_list)
         self.global_scale = global_scale
+
+        pd_max = 200.0
+        t1_max = 2000.0
+        t2_max = 500.0
+
+        config_path = os.path.join(self.data_path, 'config_properties.json')
+        try:
+            with open(config_path, 'r') as f:
+                config_data = json.load(f)
+                pd_max = config_data['PD_max']
+                t1_max = config_data['T1_max']
+                t2_max = config_data['T2_max']
+                logger.info(f"Loaded property max values from config: PD_max={pd_max}, T1_max={t1_max}, T2_max={t2_max}")
+
+                if config_data['save_normalized']:
+                    logger.info("Properties are saved normalized to [0,1]. Using max values for scaling)")
+                    self.props_scale = torch.tensor([pd_max, t1_max, t2_max], dtype=torch.float32).view(3, 1, 1)
+                else:
+                    logger.info("Properties are saved in physical units. No scaling applied.")
+                    self.props_scale = torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32).view(3, 1, 1)
+
+        except FileNotFoundError:
+            logger.warning(f"Config file not found at {config_path}. I'm normalizing using default property max values: PD_max={pd_max}, T1_max={t1_max}, T2_max={t2_max}")
+
+        except KeyError as e:
+            logger.warning(f"Missing key in config file: {e}. I'm normalizing using default property max values: PD_max={pd_max}, T1_max={t1_max}, T2_max={t2_max}")
+
+
 
     def __getitem__(self, idx):
         # load the original sample and take only the mask
@@ -49,7 +78,7 @@ class CustomDatasetTexturizer(FastDatasetDIDC):
             props_slice = np.load(props_path, mmap_mode='r')[..., slice_idx]
 
         mri_slice_tensor = torch.from_numpy(mri_slice.copy() / self.global_scale).float()
-        props_slice_tensor = torch.from_numpy(props_slice.copy()).float()
+        props_slice_tensor = torch.from_numpy(props_slice.copy()).float() * self.props_scale # crucial because properties are saved normalized to [0,1], so we need to scale them back to their actual range
 
         return {'input_label': label, 'mri_slice': mri_slice_tensor, 'props_slice': props_slice_tensor}
 
@@ -116,8 +145,8 @@ def main():
     all_files = sorted(list(set([f.replace('_props.npy', '') for f in os.listdir(config.data_path) if f.endswith('props.npy')])))
     train_files, val_files = train_test_split(all_files, test_size=config.val_fraction, random_state=config.seed)
 
-    train_dataset = CustomDatasetTexturizer(data_path=config.data_path, file_list=train_files)
-    val_dataset = CustomDatasetTexturizer(data_path=config.data_path, file_list=val_files)
+    train_dataset = CustomDatasetTexturizer(data_path=config.data_path, file_list=train_files, logger=logger)
+    val_dataset = CustomDatasetTexturizer(data_path=config.data_path, file_list=val_files, logger=logger)
     train_loader = DataLoader(train_dataset, batch_size=config.batch_size_per_gpu, shuffle=True, num_workers=config.num_workers)
     val_dataloader = DataLoader(val_dataset, batch_size=config.batch_size_per_gpu, shuffle=False, num_workers=config.num_workers)
 

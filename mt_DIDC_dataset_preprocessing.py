@@ -88,21 +88,18 @@ def create_mmap_dataset(source_dir, dest_dir, save_images=False):
         fg_stack = torch.stack(fg_list, dim=0)
         mask_stack = torch.stack(mask_list, dim=0)
 
-        np.save(os.path.join(dest_dir, f"{pat_id}_fg.npy"), fg_stack.numpy())
-        np.save(os.path.join(dest_dir, f"{pat_id}_mask.npy"), mask_stack.numpy())
+        np.save(os.path.join(dest_dir, f"{pat_id}_fg.npy"), fg_stack.numpy().astype(np.uint8))
+        np.save(os.path.join(dest_dir, f"{pat_id}_mask.npy"), mask_stack.numpy().astype(np.uint8)) # save as uint8 to reduce disk space, the values can be restored to long during training by multiplying with 1.0 and converting to long
+        
         if save_images:
             img_stack = torch.stack(img_list, dim=0)
-            np.save(os.path.join(dest_dir, f"{pat_id}_img.npy"), img_stack.numpy())
-                
-        # msg = f"Processed {file}: fg shape {fg_stack.shape}, mask shape {mask_stack.shape}"
-        # if save_images:
-        #     msg += f", img shape {img_stack.shape}"
-        # print(msg)
+            np.save(os.path.join(dest_dir, f"{pat_id}_img.npy"), img_stack.numpy().astype(np.float16)) # save as float16 to reduce disk space, the values can be restored to float32 during training by multiplying with 255.0
+
 
 
 if __name__ == "__main__":
     source_dir = 'DIDC_multiclass_coro_v2'
-    dest_dir = 'DIDC_multiclass_coro_v2_prep_3'
+    dest_dir = 'DIDC_multiclass_coro_v2_prep'
     save_images = True
     create_mmap_dataset(source_dir, dest_dir, save_images)
     

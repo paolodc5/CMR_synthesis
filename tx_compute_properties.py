@@ -20,10 +20,10 @@ from utils import load_original_labels, setup_logger, set_reproducibility
 
 @dataclass
 class Config:
-    data_dir: str = './DIDC_multiclass_coro_v2_prep_2'
-    out_dir: str = './DIDC_multiclass_coro_v2_prep_3'
+    data_dir: str = './DIDC_multiclass_coro_v2_prep'
+    out_dir: str = './DIDC_multiclass_coro_v2_prep'
     
-    epochs: int = 500
+    epochs: int = 1500
     lr: float = 0.001
     patience: int = 50
     min_delta: float = 1e-4
@@ -31,6 +31,7 @@ class Config:
     PD_max: float = 200.0
     T1_max: float = 2000.0
     T2_max: float = 500.0
+
     TR: float = 3.0
     TE: float = 1.5
     flip_angle: float = 0.6
@@ -39,10 +40,13 @@ class Config:
 
     lambda_reg: float = 0.01
     lambda_pd: float = 10000
-    lambda_t1: float = 0.1
-    lambda_t2: float = 0.01
+    lambda_t1: float = 1
+    lambda_t2: float = 0.1
 
-    batch_size = 64
+    force_restart: bool = True  # If true, overrides existing results in out_dir
+    save_normalized: bool = True
+
+    batch_size: int = 256
 
     save_hd_images: bool = False
     slices_first: bool = True
@@ -129,11 +133,10 @@ class PropertyGenerator:
 
     def _bssfp_signal_model(self, offsets, init_values):
         """bSSFP physical simulator"""
-        # Sums offsets with initial values, clamps to range, and rescales to physical units
-        PD = torch.clamp(offsets[:, 0, ...] + init_values[:, 0, ...], 0.001, 50) * self.PD_max
-        T1 = torch.clamp(offsets[:, 1, ...] + init_values[:, 1, ...], 0.001, 50) * self.T1_max
-        T2 = torch.clamp(offsets[:, 2, ...] + init_values[:, 2, ...], 0.001, 50) * self.T2_max
-        
+        PD = torch.clamp(offsets[:, 0, ...] + init_values[:, 0, ...], 0.001, 30)*self.PD_max
+        T1 = torch.clamp(offsets[:, 1, ...] + init_values[:, 1, ...], 0.001, 30)*self.T1_max
+        T2 = torch.clamp(offsets[:, 2, ...] + init_values[:, 2, ...], 0.001, 30)*self.T2_max
+
         num = PD * np.sin(self.flip_angle)
         den = (T1 / T2 + 1) - np.cos(self.flip_angle) * (T1 / T2 - 1)
         decay = torch.exp(-self.TE / T2)
@@ -206,9 +209,15 @@ class PropertyGenerator:
             best_scale[uninitialized] = scale_mag[uninitialized].detach()
             
         final_props = torch.zeros_like(best_offsets)
-        final_props[:, 0] = torch.clamp(best_offsets[:, 0] + init_tissue_properties[:, 0], 0.001, 50) * self.PD_max
-        final_props[:, 1] = torch.clamp(best_offsets[:, 1] + init_tissue_properties[:, 1], 0.001, 50) * self.T1_max
-        final_props[:, 2] = torch.clamp(best_offsets[:, 2] + init_tissue_properties[:, 2], 0.001, 50) * self.T2_max
+
+        if self.config.save_normalized:
+            final_props[:, 0] = torch.clamp(best_offsets[:, 0] + init_tissue_properties[:, 0], 0.001, 30) 
+            final_props[:, 1] = torch.clamp(best_offsets[:, 1] + init_tissue_properties[:, 1], 0.001, 30) 
+            final_props[:, 2] = torch.clamp(best_offsets[:, 2] + init_tissue_properties[:, 2], 0.001, 30)
+        else:
+            final_props[:, 0] = torch.clamp(best_offsets[:, 0] + init_tissue_properties[:, 0], 0.001, 30) * self.PD_max
+            final_props[:, 1] = torch.clamp(best_offsets[:, 1] + init_tissue_properties[:, 1], 0.001, 30) * self.T1_max
+            final_props[:, 2] = torch.clamp(best_offsets[:, 2] + init_tissue_properties[:, 2], 0.001, 30) * self.T2_max
         
         final_img = self._bssfp_signal_model(best_offsets, init_tissue_properties) * (1 + best_scale)
         
@@ -267,9 +276,10 @@ class PropertyGenerator:
         logging.info(f"Patient {self.pat_id}: Average Slice Loss = {avg_pat_loss:.4f}")
 
         if self.save_images:
-            np.save(os.path.join(out_path, f'{self.pat_id}_MRI_matrix_HD.npy'), mri_hd)
-            np.save(os.path.join(out_path, f'{self.pat_id}_labels_matrix_HD.npy'), labels_hd)
-        np.save(os.path.join(out_path, f'{self.pat_id}_props.npy'), tissue_props)
+            np.save(os.path.join(out_path, f'{self.pat_id}_MRI_matrix_HD.npy'), mri_hd.astype(np.float16))
+            np.save(os.path.join(out_path, f'{self.pat_id}_labels_matrix_HD.npy'), labels_hd.astype(np.uint8))
+            
+        np.save(os.path.join(out_path, f'{self.pat_id}_props.npy'), tissue_props.astype(np.float16)) # save in half precision to save space
 
 def main():
     config = Config()
@@ -290,6 +300,25 @@ def main():
 
     files = sorted([f for f in os.listdir(config.data_dir) if f.endswith('fg.npy')])
 
+    if not config.force_restart:
+        files_to_process = []
+        for file in files: 
+            pat_id = file.replace('_fg.npy', '')
+            props_path = os.path.join(config.out_dir, f'{pat_id}_props.npy')
+
+            if not os.path.exists(props_path):
+                files_to_process.append(file)
+            
+            skipped = len(files) - len(files_to_process)
+
+        if skipped > 0:
+            logging.info(f"Skipping {skipped} already processed files. Use force_restart=True to override.")
+        else:
+            logging.info("No existing processed files found. Starting fresh computation.")
+    else:
+        logging.info("force_restart=True: All existing processed files will be overridden.")
+
+
     pbar = tqdm(files, leave=True, desc="Processing Patients")
     for file in pbar:
         pat_id = file.replace('_fg.npy', '')
@@ -298,8 +327,8 @@ def main():
         path_mask = os.path.join(config.data_dir, pat_id + '_mask.npy')
         path_img = os.path.join(config.data_dir, pat_id + '_img.npy')
 
-        labels_volume = np.load(path_mask)
-        mri_volume = np.load(path_img)
+        labels_volume = np.load(path_mask).astype(np.int32)
+        mri_volume = np.load(path_img).astype(np.float32)
 
         mri_volume = mri_volume / np.max(mri_volume) # Normalize to [0, 1] for better optimization stability
         
