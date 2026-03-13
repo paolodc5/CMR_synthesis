@@ -14,7 +14,7 @@ def create_mmap_dataset(source_dir, dest_dir, save_images=False):
     dataset_params = {
         "source_data": source_dir,
         "target_size_preprocessing": 384,
-        "rm_black_slices": False,
+        "rm_black_slices": True,
         "remap_nn": False,
         "threshold_classes": None,
         "min_blob_size": None,
@@ -72,7 +72,7 @@ def create_mmap_dataset(source_dir, dest_dir, save_images=False):
                 mask_vol = mask_vol.reshape(fg_slice.shape[1], fg_slice.shape[2], -1, order='F')
             mask_slice = torch.from_numpy(mask_vol[:, :, idx]).unsqueeze(0).long()
 
-            fg_proc, mask_proc = dataset.process_slice(fg_slice, mask_slice)
+            fg_proc, mask_proc = dataset.process_slice(fg_slice, mask_slice) # !!! here happens the preprocessing
 
             if fg_proc.dim() == 4 and fg_proc.shape[0] == 1:
                 fg_proc = fg_proc.squeeze(0)
@@ -99,7 +99,7 @@ def create_mmap_dataset(source_dir, dest_dir, save_images=False):
 
 if __name__ == "__main__":
     source_dir = 'DIDC_multiclass_coro_v2'
-    dest_dir = 'DIDC_multiclass_coro_v2_prep'
-    save_images = True
+    dest_dir = 'DIDC_multiclass_coro_v2_prep_noblack'
+    save_images = False
     create_mmap_dataset(source_dir, dest_dir, save_images)
     

@@ -60,7 +60,7 @@ GROUPING_RULES = {
 # ITIS database values for reference
 PROPERTY_KEY = {
     "blood": [80.43, 1414.8, 308.5],  # (ITIS)
-    "bone": [15.30, 288.0, 165.0], # (ITIS yellow marrow)
+    "bone": [40.80, 549.0, 49.0], # (ITIS red marrow)
     "muscle": [76.21, 981.5, 36.0], # (ITIS)
     "fat": [100., 288.0, 165.0],  # (Gold et al. 2012, subcutaneous fat)
     "heart_muscle": [79.47, 1026.3, 42.0],  # (ITIS)
@@ -76,6 +76,7 @@ PROPERTY_KEY = {
     "trachea": [60.00, 1045.5, 37.3] # (ITIS)
 }
 # "cartilage": [71.77, 1045.5, 37.3], # (ITIS)
+# "bone": [15.30, 288.0, 165.0], # (ITIS yellow marrow)
 
 LABEL2LABEL = {
     "Aorta": "blood",
@@ -95,7 +96,7 @@ LABEL2LABEL = {
     "Muscle": "muscle",
     "Others": "others",
     "Pancreas": "pancreas",
-    "RV_blood_pool_myocardium": "heart_muscle",
+    "RV_blood_pool_myocardium": "blood",
     "Skin": "skin",
     "Spinal_cord": "spinal_cord",
     "Spleen": "spleen",

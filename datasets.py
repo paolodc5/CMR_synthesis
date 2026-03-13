@@ -567,10 +567,12 @@ class DatasetDIDC(Dataset):
     def __getitem__(self, idx):
         return {'input_label': self.fg_tensor[idx].float(), 'multiClassMask': self.segm_masks_tensor[idx]}
 
+
 # For preprocessed datasets already saved in data_path
 class FastDatasetDIDC(Dataset):
-    def __init__(self, data_path, file_list=None):
+    def __init__(self, data_path, file_list=None, rm_black_slices=False):
         self.data_path = data_path
+        self.rm_black_slices = rm_black_slices
 
         if file_list is None:
             all_files = os.listdir(data_path)
@@ -583,11 +585,16 @@ class FastDatasetDIDC(Dataset):
             fg_path = os.path.join(data_path, f"{pat_id}_fg.npy")
 
             if os.path.exists(fg_path):
-                shape = np.load(fg_path, mmap_mode='r').shape 
-                num_slices = shape[0]
+                fg_vol = np.load(fg_path, mmap_mode='r')
+                num_slices = fg_vol.shape[0]
+                
+                if self.rm_black_slices:
+                    valid_slices = np.where(fg_vol[:,1:,...].reshape(num_slices, -1).any(axis=1))[0] # background channel is ignored in the check for empty slices
+                else:
+                    valid_slices = range(num_slices)
 
-                for i in range(num_slices):
-                    self.samples.append((pat_id, i))
+                for k in valid_slices:
+                    self.samples.append((pat_id, k))
             else:
                 print(f"Foreground file for patient {pat_id} not found at {fg_path}. Skipping.")
 
@@ -610,8 +617,8 @@ class FastDatasetDIDC(Dataset):
 
 
 class CustomDataset(FastDatasetDIDC):
-    def __init__(self, data_path, target_size, file_list=None):
-        super().__init__(data_path, file_list)
+    def __init__(self, data_path, target_size, file_list=None, rm_black_slices=False):
+        super().__init__(data_path, file_list, rm_black_slices=rm_black_slices)
         self.custom_target_shape = target_size
 
     def __getitem__(self, idx):

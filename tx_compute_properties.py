@@ -23,7 +23,7 @@ class Config:
     data_dir: str = './DIDC_multiclass_coro_v2_prep'
     out_dir: str = './DIDC_multiclass_coro_v2_prep'
     
-    epochs: int = 1500
+    epochs: int = 2000
     lr: float = 0.001
     patience: int = 50
     min_delta: float = 1e-4
@@ -39,9 +39,9 @@ class Config:
     upsample_factor: int = 1
 
     lambda_reg: float = 0.01
-    lambda_pd: float = 10000
-    lambda_t1: float = 1
-    lambda_t2: float = 0.1
+    lambda_pd: float = 1000
+    lambda_t1: float = 100
+    lambda_t2: float = 100
 
     force_restart: bool = True  # If true, overrides existing results in out_dir
     save_normalized: bool = True
