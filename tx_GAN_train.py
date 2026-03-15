@@ -23,6 +23,7 @@ from mt_DIDC_config import GROUPING_RULES, NEW_LABELS
 from tx_trainer import GANTrainer, UnetTrainer
 from tx_config import GANTrainerConfig, UnetTrainerConfig
 from tx_bssfps_simulator import bSSFPSimulator
+from spade_gan import SPADEGenerator
 
 # Setup logger
 logger = get_logger(__name__, log_level="INFO")
@@ -106,15 +107,17 @@ def main():
         '--mode', 
         type=str, 
         required=True, 
-        choices=['unet', 'gan'], 
+        choices=['unet', 'gan', 'spade_gan'], 
         help="Choose which model to train: 'unet' or 'gan'"
     )
     args = parser.parse_args()
 
     if args.mode == 'gan':
         config = GANTrainerConfig()
-    else:
+    elif args.mode == 'unet':
         config = UnetTrainerConfig()
+    elif args.mode == 'spade_gan':
+        config = GANTrainerConfig()
 
     set_reproducibility(config.seed)
     
@@ -167,9 +170,14 @@ def main():
 
     bssfp_sim = bSSFPSimulator(config.bssfp_model)
 
-    if args.mode == 'gan':
-        gen = GeneratorModel(**asdict(config.gen_model)) # input channels: 1 or 22
+    if args.mode == 'gan' or args.mode == 'spade_gan':
+        if args.mode == 'gan':
+            gen = GeneratorModel(**asdict(config.gen_model)) # input channels: 1 or 22
+        elif args.mode == 'spade_gan':
+            gen = SPADEGenerator(**asdict(config.spade_model))
+
         discr = DiscriminatorModel(**asdict(config.discr_model)) # 4 channels: (1 condition + 3 offset)
+
 
         opt_G = torch.optim.AdamW(gen.parameters(), lr=config.lr_gen)
         opt_D = torch.optim.AdamW(discr.parameters(), lr=config.lr_discr)
@@ -209,7 +217,8 @@ def main():
             accelerator=accelerator,
             logger=logger
         )
-        
+    
+
     trainer.train()
 
 

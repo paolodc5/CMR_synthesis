@@ -35,13 +35,19 @@ class GeneratorConfig:
     pool: bool = False
     dropout_p: float = 0.3
 
+@dataclass
+class SpadeConfig:
+    label_nc: int = 22
+    latent_dim=256
+    output_ch=3
+
 
 @dataclass
 class GANTrainerConfig:
-    run_name: str = "texturizer_GAN_train_L2reg_gs"
+    run_name: str = "texturizer_SPADE_GAN_train"
     exp_dir: str = "./experiments/DIDCV2_TEXT"
     
-    data_path: str = "./DIDC_multiclass_coro_v2_prep_2"
+    data_path: str = "./DIDC_multiclass_coro_v2_prep"
     autoenc_path = str = ""
     
     # Hyperparams
@@ -72,6 +78,7 @@ class GANTrainerConfig:
     bssfp_model: BSSFPConfig = field(default_factory=BSSFPConfig)
     discr_model: DiscrConfig = field(default_factory=DiscrConfig)
     gen_model: GeneratorConfig = field(default_factory=GeneratorConfig)
+    spade_model: SpadeConfig = field(default_factory=SpadeConfig)
 
     def __post_init__(self):
         timestamp = datetime.now().strftime('%Y%m%d_%H%M')

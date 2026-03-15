@@ -121,11 +121,9 @@ class SPADEGenerator(nn.Module):
         return x
 
 if __name__ == "__main__":
-    # Test rapido per verificare che il modulo funzioni
     spade = SPADEGenerator(label_nc=10)
-    #random noise
     z = torch.randn(5, 256)
     print(z.shape)
-    mask = torch.randint(0, 10, (5, 10, 128, 128)).float()  # maschera con 10 classi
+    mask = torch.randint(0, 10, (5, 10, 128, 128)).float()
     out = spade(z, mask)
-    print(out.shape)  # dovrebbe essere (5, 3, 128, 128)
+    print(out.shape)  
